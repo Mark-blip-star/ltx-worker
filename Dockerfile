@@ -31,12 +31,12 @@ RUN set -eux; \
     uv pip install --python "$VENV/bin/python" runpod; \
     rm -rf /tmp/fa3
 
-# 4. Weights baked (downloaded on RunPod build infra; HF_TOKEN via build ARG)
-ARG HF_TOKEN
-RUN python3 -m venv /opt/hf && /opt/hf/bin/pip install -q -U "huggingface_hub[cli]" && \
-    HF_TOKEN="$HF_TOKEN" /opt/hf/bin/hf download Lightricks/LTX-2.3-fp8 ltx-2.3-22b-dev-fp8.safetensors --local-dir /app/models/fp8 && \
-    HF_TOKEN="$HF_TOKEN" /opt/hf/bin/hf download Lightricks/LTX-2.3 ltx-2.3-spatial-upscaler-x2-1.1.safetensors ltx-2.3-22b-distilled-lora-384-1.1.safetensors --local-dir /app/models/base && \
-    HF_TOKEN="$HF_TOKEN" /opt/hf/bin/hf download google/gemma-3-12b-it --local-dir /app/models/gemma
+# 4. LTX weights BAKED at build — Lightricks repos are PUBLIC (no token needed).
+#    Gemma (gated google/gemma-3-12b-it) is NOT baked: RunPod github-build can't pass build
+#    secrets, so it's fetched at RUNTIME in handler.py via the runtime HF_TOKEN env.
+RUN python3 -m venv /opt/hf && /opt/hf/bin/pip install -q -U "huggingface_hub" && \
+    /opt/hf/bin/hf download Lightricks/LTX-2.3-fp8 ltx-2.3-22b-dev-fp8.safetensors --local-dir /app/models/fp8 && \
+    /opt/hf/bin/hf download Lightricks/LTX-2.3 ltx-2.3-spatial-upscaler-x2-1.1.safetensors ltx-2.3-22b-distilled-lora-384-1.1.safetensors --local-dir /app/models/base
 
 # 5. Entrypoint
 ENV LTX_FP8_CKPT=/app/models/fp8/ltx-2.3-22b-dev-fp8.safetensors \

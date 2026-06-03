@@ -24,6 +24,18 @@ UPS = os.environ["LTX_UPSCALER"]
 LORA = os.environ["LTX_DISTILLED_LORA"]
 os.environ.setdefault("LTX_TGATE_START_STEP", "10")  # conservative default
 
+# ---- Gemma (gated) fetched at RUNTIME (build can't access gated HF repos). One-time per
+#      from-scratch worker; FlashBoot snapshots the loaded model so restored starts skip it. ----
+if not os.path.exists(os.path.join(GEMMA, "config.json")):
+    print("[init] downloading Gemma (runtime, gated) ...", flush=True)
+    from huggingface_hub import snapshot_download
+    snapshot_download(
+        "google/gemma-3-12b-it",
+        local_dir=GEMMA,
+        token=os.environ.get("HF_TOKEN"),
+    )
+    print("[init] Gemma downloaded", flush=True)
+
 # ---- load ONCE (residency): models stay resident in VRAM for the worker lifetime ----
 print("[init] building pipeline...", flush=True)
 PIPE = TI2VidTwoStagesPipeline(
