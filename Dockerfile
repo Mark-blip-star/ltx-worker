@@ -1,5 +1,5 @@
 # LTX-2.3 serverless worker — RunPod GitHub-build (builds on RunPod infra).
-# FA3 built from source + weights downloaded at build time (no big files in git).
+# FA3 pulled as a prebuilt wheel + weights downloaded at build time (no big files in git).
 # Build ARG HF_TOKEN required (set in RunPod endpoint build env).
 FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
 
@@ -12,20 +12,18 @@ COPY LTX-2 /app/LTX-2
 COPY handler.py /app/handler.py
 COPY warmup.jpg /app/warmup.jpg
 
-# 2. Frozen venv (torch 2.7.1+cu126)
-RUN cd /app/LTX-2 && uv sync --frozen --extra fp8-trtllm
+# 2. Frozen venv (torch 2.7.1+cu126). Bootstrap uv if the base image lacks it.
+RUN (command -v uv >/dev/null 2>&1 || pip install --no-cache-dir -q uv) && \
+    cd /app/LTX-2 && uv sync --frozen --extra fp8-trtllm
 ENV VENV=/app/LTX-2/.venv PATH="/app/LTX-2/.venv/bin:${PATH}"
 
-# 3. FlashAttention-3 from source (pinned commit, sm_90a, fwd-only) — built on RunPod infra
-RUN git clone https://github.com/Dao-AILab/flash-attention.git /tmp/fa && \
-    cd /tmp/fa && git checkout f82d0dc6d69bfb80f319a6b8909d94e60c2fb7b1 && \
-    git submodule update --init --recursive && \
-    uv pip install --python "$VENV/bin/python" -U setuptools wheel ninja packaging && \
-    cd /tmp/fa/hopper && \
-    TORCH_CUDA_ARCH_LIST="9.0a" MAX_JOBS=16 FLASH_ATTENTION_DISABLE_BACKWARD=TRUE \
-        "$VENV/bin/python" setup.py install && \
-    "$VENV/bin/python" -c "import flash_attn_interface; print('FA3 ok')" && \
-    uv pip install --python "$VENV/bin/python" runpod && rm -rf /tmp/fa
+# 3. FlashAttention-3 — prebuilt wheel (sm_90a, torch 2.7.1+cu126), pulled from public release.
+#    Avoids nvcc dependency, CUDA-version skew, and ~40-min source compile on RunPod infra.
+#    (abi3 wheel → installs on CPython 3.10+; runtime warmup validates the import on Hopper.)
+RUN curl -fsSL -o /tmp/fa3.whl \
+      https://github.com/Mark-blip-star/ltx-fa3/releases/download/v1/flash_attn_3-3.0.0-cp310-abi3-linux_x86_64.whl && \
+    uv pip install --python "$VENV/bin/python" /tmp/fa3.whl && \
+    uv pip install --python "$VENV/bin/python" runpod && rm -f /tmp/fa3.whl
 
 # 4. Weights baked (downloaded on RunPod build infra; HF_TOKEN via build ARG)
 ARG HF_TOKEN
