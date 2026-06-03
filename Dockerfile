@@ -19,11 +19,16 @@ ENV VENV=/app/LTX-2/.venv PATH="/app/LTX-2/.venv/bin:${PATH}"
 
 # 3. FlashAttention-3 — prebuilt wheel (sm_90a, torch 2.7.1+cu126), pulled from public release.
 #    Avoids nvcc dependency, CUDA-version skew, and ~40-min source compile on RunPod infra.
-#    (abi3 wheel → installs on CPython 3.10+; runtime warmup validates the import on Hopper.)
-RUN curl -fsSL -o /tmp/fa3.whl \
-      https://github.com/Mark-blip-star/ltx-fa3/releases/download/v1/flash_attn_3-3.0.0-cp310-abi3-linux_x86_64.whl && \
-    uv pip install --python "$VENV/bin/python" /tmp/fa3.whl && \
-    uv pip install --python "$VENV/bin/python" runpod && rm -f /tmp/fa3.whl
+#    --no-deps: deps (torch/einops) already satisfied by the frozen sync; don't let uv touch the
+#    frozen env (that resolution was the build failure). set -eux makes any failure self-evident.
+RUN set -eux; \
+    "$VENV/bin/python" --version; \
+    curl -fSL -o /tmp/fa3.whl \
+      "https://github.com/Mark-blip-star/ltx-fa3/releases/download/v1/flash_attn_3-3.0.0-cp310-abi3-linux_x86_64.whl"; \
+    ls -l /tmp/fa3.whl; \
+    uv pip install --python "$VENV/bin/python" --no-deps /tmp/fa3.whl; \
+    uv pip install --python "$VENV/bin/python" runpod; \
+    rm -f /tmp/fa3.whl
 
 # 4. Weights baked (downloaded on RunPod build infra; HF_TOKEN via build ARG)
 ARG HF_TOKEN
