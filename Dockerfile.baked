@@ -1,0 +1,44 @@
+# syntax=docker/dockerfile:1.4
+# LTX-2.3 serverless worker — BAKED weights, built with `docker buildx ... --push` and
+# pushed to a registry (ghcr), then deployed from that image (NOT RunPod github-build,
+# which has a 30-min build limit that a ~60GB baked image blows past on export).
+# Gated Gemma is downloaded via a BuildKit secret (never leaked into image layers):
+#   docker buildx build --platform linux/amd64 --secret id=hf_token,env=HF_TOKEN -t <img> --push .
+FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
+
+ENV DEBIAN_FRONTEND=noninteractive HF_HUB_DISABLE_PROGRESS_BARS=1 \
+    PYTHONUNBUFFERED=1 CUDA_MODULE_LOADING=EAGER HF_HUB_ENABLE_HF_TRANSFER=1
+WORKDIR /app
+
+# 1. Code
+COPY LTX-2 /app/LTX-2
+COPY handler.py /app/handler.py
+COPY warmup.jpg /app/warmup.jpg
+
+# 2. Frozen venv (torch 2.7.1+cu126)
+RUN (command -v uv >/dev/null 2>&1 || pip install --no-cache-dir -q uv) && \
+    cd /app/LTX-2 && uv sync --frozen --extra fp8-trtllm
+ENV VENV=/app/LTX-2/.venv PATH="/app/LTX-2/.venv/bin:${PATH}"
+
+# 3. FA3 prebuilt wheel (sm_90a, torch 2.7.1+cu126), --no-deps (deps already in frozen sync)
+RUN curl -fSL -o /tmp/flash_attn_3-3.0.0-cp310-abi3-linux_x86_64.whl \
+      "https://github.com/Mark-blip-star/ltx-fa3/releases/download/v1/flash_attn_3-3.0.0-cp310-abi3-linux_x86_64.whl" && \
+    uv pip install --python "$VENV/bin/python" --no-deps /tmp/flash_attn_3-3.0.0-cp310-abi3-linux_x86_64.whl && \
+    uv pip install --python "$VENV/bin/python" runpod && rm -f /tmp/*.whl
+
+# 4. BAKE all weights. LTX = public (no token). Gemma = gated → BuildKit secret hf_token
+#    (mounted only for this RUN; never stored in the image).
+RUN --mount=type=secret,id=hf_token \
+    python3 -m venv /opt/hf && /opt/hf/bin/pip install -q -U "huggingface_hub" "hf_transfer" && \
+    /opt/hf/bin/hf download Lightricks/LTX-2.3-fp8 ltx-2.3-22b-dev-fp8.safetensors --local-dir /app/models/fp8 && \
+    /opt/hf/bin/hf download Lightricks/LTX-2.3 ltx-2.3-spatial-upscaler-x2-1.1.safetensors ltx-2.3-22b-distilled-lora-384-1.1.safetensors --local-dir /app/models/base && \
+    HF_TOKEN="$(cat /run/secrets/hf_token)" /opt/hf/bin/hf download google/gemma-3-12b-it --local-dir /app/models/gemma && \
+    rm -rf /opt/hf /root/.cache/huggingface
+
+# 5. Entrypoint (baked weight paths; handler's _ensure_weights() is a no-op since files exist)
+ENV LTX_FP8_CKPT=/app/models/fp8/ltx-2.3-22b-dev-fp8.safetensors \
+    LTX_GEMMA_ROOT=/app/models/gemma \
+    LTX_UPSCALER=/app/models/base/ltx-2.3-spatial-upscaler-x2-1.1.safetensors \
+    LTX_DISTILLED_LORA=/app/models/base/ltx-2.3-22b-distilled-lora-384-1.1.safetensors \
+    LTX_WARMUP_IMG=/app/warmup.jpg
+CMD ["/app/LTX-2/.venv/bin/python", "/app/handler.py"]
