@@ -10,8 +10,12 @@ import traceback
 import torch  # noqa: F401  (ensure CUDA init early)
 import runpod
 
-from ltx_core.quantization import QuantizationPolicy
+# NOTE: import ltx_core.loader BEFORE ltx_core.quantization. quantization.fp8_cast and
+# loader.fuse_loras form a circular import; loading the loader package first lets
+# loader.kernels resolve before fp8_cast needs it, breaking the cycle. Importing
+# quantization first triggers ImportError: cannot import name 'fused_add_round_launch'.
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
+from ltx_core.quantization import QuantizationPolicy
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
 from ltx_pipelines.utils.args import ImageConditioningInput
