@@ -24,17 +24,29 @@ UPS = os.environ["LTX_UPSCALER"]
 LORA = os.environ["LTX_DISTILLED_LORA"]
 os.environ.setdefault("LTX_TGATE_START_STEP", "10")  # conservative default
 
-# ---- Gemma (gated) fetched at RUNTIME (build can't access gated HF repos). One-time per
-#      from-scratch worker; FlashBoot snapshots the loaded model so restored starts skip it. ----
-if not os.path.exists(os.path.join(GEMMA, "config.json")):
-    print("[init] downloading Gemma (runtime, gated) ...", flush=True)
-    from huggingface_hub import snapshot_download
-    snapshot_download(
-        "google/gemma-3-12b-it",
-        local_dir=GEMMA,
-        token=os.environ.get("HF_TOKEN"),
-    )
-    print("[init] Gemma downloaded", flush=True)
+# ---- Weights fetched at RUNTIME (not baked — RunPod's 30-min build limit can't export a
+#      baked-weights image in time). LTX repos are public; Gemma is gated (needs HF_TOKEN).
+#      One-time per from-scratch worker; FlashBoot snapshots the loaded models so warm/
+#      restored starts skip this entirely. ----
+def _ensure_weights():
+    from huggingface_hub import hf_hub_download, snapshot_download
+    tok = os.environ.get("HF_TOKEN")
+    os.makedirs(os.path.dirname(CKPT), exist_ok=True)
+    os.makedirs(os.path.dirname(UPS), exist_ok=True)
+    if not os.path.exists(CKPT):
+        print("[init] downloading LTX fp8 (public) ...", flush=True)
+        hf_hub_download("Lightricks/LTX-2.3-fp8", "ltx-2.3-22b-dev-fp8.safetensors",
+                        local_dir=os.path.dirname(CKPT))
+    for fn in ("ltx-2.3-spatial-upscaler-x2-1.1.safetensors", "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"):
+        if not os.path.exists(os.path.join(os.path.dirname(UPS), fn)):
+            print(f"[init] downloading LTX {fn} (public) ...", flush=True)
+            hf_hub_download("Lightricks/LTX-2.3", fn, local_dir=os.path.dirname(UPS))
+    if not os.path.exists(os.path.join(GEMMA, "config.json")):
+        print("[init] downloading Gemma (gated) ...", flush=True)
+        snapshot_download("google/gemma-3-12b-it", local_dir=GEMMA, token=tok)
+    print("[init] weights ready", flush=True)
+
+_ensure_weights()
 
 # ---- load ONCE (residency): models stay resident in VRAM for the worker lifetime ----
 print("[init] building pipeline...", flush=True)
