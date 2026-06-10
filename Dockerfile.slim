@@ -1,0 +1,48 @@
+# syntax=docker/dockerfile:1.4
+# LTX-2.3 serverless worker — SLIM image (NO weights baked).
+# Weights come from RunPod "Cached Models" (host-level HF cache) at runtime; this image is just
+# code + venv + FA3, kept well under RunPod's ~35 GB practical rollout ceiling.
+#   docker buildx build --platform linux/amd64 --provenance=false -t ghcr.io/mark-blip-star/ltx-worker-slim:v2 --push .
+FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 \
+    CUDA_MODULE_LOADING=EAGER HF_HUB_ENABLE_HF_TRANSFER=1 \
+    UV_PYTHON_INSTALL_DIR=/opt/uv-python UV_LINK_MODE=copy
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl ca-certificates libgomp1 && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+WORKDIR /app
+# --- venv first (so code changes below don't invalidate the heavy uv-sync layer) ---
+COPY LTX-2 /app/LTX-2
+RUN cd /app/LTX-2 && uv python install 3.12 && \
+    uv sync --frozen --extra fp8-trtllm --python 3.12 && \
+    uv cache clean
+ENV VENV=/app/LTX-2/.venv PATH="/app/LTX-2/.venv/bin:${PATH}"
+
+# FA3 prebuilt wheel (sm_90a, torch 2.7.1+cu126), --no-deps, KEEP ORIGINAL FILENAME
+RUN curl -fSL -o /tmp/flash_attn_3-3.0.0-cp310-abi3-linux_x86_64.whl \
+      "https://github.com/Mark-blip-star/ltx-fa3/releases/download/v1/flash_attn_3-3.0.0-cp310-abi3-linux_x86_64.whl" && \
+    uv pip install --python "$VENV/bin/python" --no-deps /tmp/flash_attn_3-3.0.0-cp310-abi3-linux_x86_64.whl && \
+    uv pip install --python "$VENV/bin/python" runpod bitsandbytes && rm -f /tmp/*.whl && uv cache clean
+
+# --- app code (hot layer: changes here don't rebuild venv) ---
+COPY stage_timing_runner.py /app/stage_timing_runner.py
+COPY handler.py /app/handler.py
+COPY log_uploader.py /app/log_uploader.py
+COPY start.sh /app/start.sh
+COPY warmup.jpg /app/warmup.jpg
+
+# Import smoke-test (CPU-only; catches missing .so + that handler's run_case path imports cleanly)
+RUN cd /app && /app/LTX-2/.venv/bin/python -c "import torch, numpy, PIL, av, OpenImageIO; import ltx_core.loader; import ltx_pipelines.ti2vid_two_stages; import stage_timing_runner; print('IMPORT SMOKE OK', torch.__version__)"
+
+# Weights repo provided at runtime via RunPod Cached Models (env LTX_WEIGHTS_REPO).
+# handler.py sets HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE / LTX_ATTENTION_TYPE=flash_attention_3 itself.
+ENV LTX_WEIGHTS_REPO=Markooooo/ltx-worker-weights \
+    HF_HOME=/runpod-volume/huggingface-cache
+WORKDIR /app
+CMD ["/bin/bash", "/app/start.sh"]
