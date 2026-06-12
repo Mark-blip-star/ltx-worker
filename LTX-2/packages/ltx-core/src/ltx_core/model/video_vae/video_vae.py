@@ -842,6 +842,19 @@ class VideoDecoder(nn.Module):
         for temporal_group_tiles in temporal_groups:
             curr_temporal_slice = temporal_group_tiles[0].out_coords[2]
 
+            # Stream-yield: the part of the previous chunk that the current group cannot
+            # touch (frames before curr start) is final NOW — emit it before this group's
+            # expensive decode so the consumer (x264 encode thread) overlaps with GPU work.
+            # Float addition is commutative and slice/clamp/divide are elementwise, so the
+            # pixels are bit-identical to the post-decode yield this replaces.
+            if previous_chunk is not None:
+                yield_len = curr_temporal_slice.start - previous_temporal_slice.start
+                settled_weights = previous_weights[:, :, :yield_len, :, :].clamp(min=1e-8)
+                yield previous_chunk[:, :, :yield_len, :, :] / settled_weights
+                # keep only the overlap tail for blending into the current group
+                previous_chunk = previous_chunk[:, :, yield_len:, :, :]
+                previous_weights = previous_weights[:, :, yield_len:, :, :]
+
             # Calculate the shape of the temporal buffer for this group of tiles.
             # The temporal length depends on whether this is the first tile (starts at 0) or not.
             # - First tile: (frames - 1) * scale + 1
@@ -865,31 +878,14 @@ class VideoDecoder(nn.Module):
                 generator=generator,
             )
 
-            # Blend with previous temporal chunk if it exists
-            if previous_chunk is not None:
-                # Check if current temporal slice overlaps with previous temporal slice
-                if previous_temporal_slice.stop > curr_temporal_slice.start:
-                    overlap_len = previous_temporal_slice.stop - curr_temporal_slice.start
-                    temporal_overlap_slice = slice(curr_temporal_slice.start - previous_temporal_slice.start, None)
-
-                    # The overlap is already masked before it reaches this step. Each tile is accumulated into buffer
-                    # with its trapezoidal mask, and curr_weights accumulates the same mask. In the overlap blend we add
-                    # the masked values (buffer[...]) and the corresponding weights (curr_weights[...]) into the
-                    # previous buffers, then later normalize by weights.
-                    previous_chunk[:, :, temporal_overlap_slice, :, :] += buffer[:, :, slice(0, overlap_len), :, :]
-                    previous_weights[:, :, temporal_overlap_slice, :, :] += curr_weights[
-                        :, :, slice(0, overlap_len), :, :
-                    ]
-
-                    buffer[:, :, slice(0, overlap_len), :, :] = previous_chunk[:, :, temporal_overlap_slice, :, :]
-                    curr_weights[:, :, slice(0, overlap_len), :, :] = previous_weights[
-                        :, :, temporal_overlap_slice, :, :
-                    ]
-
-                # Yield the non-overlapping part of the previous chunk
-                previous_weights = previous_weights.clamp(min=1e-8)
-                yield_len = curr_temporal_slice.start - previous_temporal_slice.start
-                yield (previous_chunk / previous_weights)[:, :, :yield_len, :, :]
+            # Blend the retained overlap tail of the previous chunk into the current buffer.
+            # The overlap is already masked before it reaches this step. Each tile is accumulated
+            # into buffer with its trapezoidal mask, and curr_weights accumulates the same mask:
+            # add the masked values and weights, then later normalize by weights.
+            if previous_chunk is not None and previous_temporal_slice.stop > curr_temporal_slice.start:
+                overlap_len = previous_temporal_slice.stop - curr_temporal_slice.start
+                buffer[:, :, slice(0, overlap_len), :, :] += previous_chunk
+                curr_weights[:, :, slice(0, overlap_len), :, :] += previous_weights
 
             # Update state for next iteration
             previous_chunk = buffer

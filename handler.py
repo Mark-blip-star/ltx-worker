@@ -98,6 +98,15 @@ FAST_DEFAULT_STEPS = int(os.environ.get("LTX_FAST_DEFAULT_STEPS", "12"))
 CONFIG_TAG = (os.environ.get("LTX_CONFIG_TAG", "v8")
               + (f"-s1_{S1_LORA_STRENGTH:g}" if S1_LORA_STRENGTH > 0 else "")
               + (f"-st{FAST_DEFAULT_STEPS}" if FAST_DEFAULT_STEPS != 12 else ""))
+# v8.7 switches. All default-off so an env-clean v8.7 binary is path-identical to v8.6.1
+# except the always-on bit-exact changes (resident tail, stream-yield decode), gated by PSNR.
+SKIP_NEG_ENCODE = os.environ.get("LTX_SKIP_NEG_ENCODE", "0") == "1"  # bit-exact: prompts encode sequentially
+WARMUP_GEN = os.environ.get("LTX_WARMUP_GEN", "0") == "1"  # full prod-shape generation inside init
+_S3 = {k: os.environ.get(f"LTX_S3_{k}") for k in ("ENDPOINT", "BUCKET", "KEY", "SECRET")}
+S3_ON = all(_S3.values())
+RETURN_URL_ONLY = os.environ.get("LTX_RETURN_URL_ONLY", "0") == "1"
+_SKIP_NEG_NOW = {"on": False}   # per-request (handler is single-threaded)
+_TAIL_RESIDENT = {"done": False}
 DEFAULT_PROMPT = os.environ.get(
     "LTX_DEFAULT_PROMPT",
     "The rider pedals forward at a steady, even pace, his body rising and dipping slightly with each "
@@ -137,6 +146,11 @@ class _StageKeyedCache(base.ResidentStageCache):
             _INIT_LOG.append(
                 f"registry cleared after {cache_key} build; "
                 f"cuda_alloc={torch.cuda.memory_allocated() / 2**30:.1f}GiB")
+        # v8.7 L-1: once both stage transformers are resident the big build transients are
+        # over — now (and only now) pin the small tail models, so their +~3.5 GiB never
+        # coexists with a 22.6 GiB fuse transient on the 94 GB H100 NVL.
+        if not hit and len(self._entries) >= 2:
+            _make_tail_resident()
         return out
 
 
@@ -146,6 +160,85 @@ _STAGE_CACHE = _StageKeyedCache()
 # 1080p activations + a non-cached fuse transient would bust 94 GiB, so larger jobs are rejected.
 _MAX_PIXELS = 1280 * 704
 _MAX_FRAMES = 121
+
+
+class _ResidentConditioner:
+    """v8.7 L-1: VAE encoder built once; upstream rebuilds + frees it per call."""
+
+    def __init__(self, inner):
+        self._enc = inner._build_encoder()
+
+    def __call__(self, fn):
+        return fn(self._enc)
+
+
+class _ResidentUpsampler:
+    def __init__(self, inner):
+        self._enc = inner._encoder_builder.build(device=inner._device, dtype=inner._dtype).to(inner._device).eval()
+        self._ups = inner._upsampler_builder.build(device=inner._device, dtype=inner._dtype).to(inner._device).eval()
+
+    def __call__(self, latent):
+        from ltx_core.model.upsampler import upsample_video
+        return upsample_video(latent=latent, video_encoder=self._enc, upsampler=self._ups)
+
+
+class _ResidentDecoder:
+    def __init__(self, inner):
+        self._dec = inner._decoder_builder.build(device=inner._device, dtype=inner._dtype).to(inner._device).eval()
+
+    def __call__(self, latent, tiling_config=None, generator=None):
+        return self._dec.decode_video(latent, tiling_config, generator)
+
+
+def _make_tail_resident():
+    """Swap per-call build-and-free tail blocks for resident ones. Bit-exact: same weights,
+    same op order — they just stop being rebuilt and torn down on every job."""
+    if _TAIL_RESIDENT["done"] or _PIPE is None:
+        return
+    try:
+        _PIPE.image_conditioner = _ResidentConditioner(_PIPE.image_conditioner)
+        _PIPE.upsampler = _ResidentUpsampler(_PIPE.upsampler)
+        _PIPE.video_decoder = _ResidentDecoder(_PIPE.video_decoder)
+        _TAIL_RESIDENT["done"] = True
+        _INIT_LOG.append(
+            f"tail resident (vae-enc/upsampler/decoder); cuda_alloc={torch.cuda.memory_allocated() / 2**30:.1f}GiB")
+    except Exception as exc:  # noqa: BLE001
+        _TAIL_RESIDENT["done"] = True  # don't retry every job
+        _INIT_LOG.append(f"tail-resident FAILED, kept per-job path: {exc!r}")
+
+
+def _s3_put(data: bytes, key: str, ctype: str) -> str:
+    """Minimal sigv4 PUT (stdlib only) to DO Spaces / any S3 endpoint. Returns public URL."""
+    import datetime as _dt
+    import hashlib
+    import hmac
+    import urllib.request as _ur
+    host = f"{_S3['BUCKET']}.{_S3['ENDPOINT']}"
+    region = _S3["ENDPOINT"].split(".")[0]
+    now = _dt.datetime.now(_dt.timezone.utc)
+    amzdate, datestamp = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
+    payload_hash = hashlib.sha256(data).hexdigest()
+    headers = {"host": host, "content-type": ctype, "x-amz-acl": "public-read",
+               "x-amz-content-sha256": payload_hash, "x-amz-date": amzdate}
+    signed = ";".join(sorted(headers))
+    canonical = ("PUT\n/" + key + "\n\n"
+                 + "".join(f"{k}:{headers[k]}\n" for k in sorted(headers)) + "\n"
+                 + signed + "\n" + payload_hash)
+    scope = f"{datestamp}/{region}/s3/aws4_request"
+    sts = ("AWS4-HMAC-SHA256\n" + amzdate + "\n" + scope + "\n"
+           + hashlib.sha256(canonical.encode()).hexdigest())
+
+    def _hm(k, m):
+        return hmac.new(k, m.encode(), hashlib.sha256).digest()
+
+    sig_key = _hm(_hm(_hm(_hm(("AWS4" + _S3["SECRET"]).encode(), datestamp), region), "s3"), "aws4_request")
+    signature = hmac.new(sig_key, sts.encode(), hashlib.sha256).hexdigest()
+    auth = f"AWS4-HMAC-SHA256 Credential={_S3['KEY']}/{scope}, SignedHeaders={signed}, Signature={signature}"
+    req = _ur.Request(f"https://{host}/{key}", data=data, method="PUT", headers={
+        "Content-Type": ctype, "x-amz-acl": "public-read",
+        "x-amz-content-sha256": payload_hash, "x-amz-date": amzdate, "Authorization": auth})
+    _ur.urlopen(req, timeout=120).read()
+    return f"https://{host}/{key}"
 
 
 def _kill_prewarm() -> None:
@@ -169,6 +262,9 @@ _LTX2Scheduler_real = base.LTX2Scheduler
 class _DispatchScheduler:
     def execute(self, steps: int):
         if _SIGMA_MODE["mode"] == "distilled":
+            ov = _SIGMA_MODE.get("override")
+            if ov:  # explicit per-request grid (request "sigmas"); validated in handler()
+                return torch.tensor(ov, dtype=torch.float32)
             if steps == 8:
                 vals = list(DISTILLED_SIGMA_VALUES)
             else:
@@ -184,12 +280,38 @@ base.LTX2Scheduler = _DispatchScheduler
 
 
 class ResidentPromptEncoder(PromptEncoder):
-    """Build the Gemma text encoder ONCE and keep it in VRAM (skip free-on-exit ctx)."""
+    """Build the Gemma text encoder ONCE and keep it in VRAM (skip free-on-exit ctx).
+
+    v8.7: the embeddings processor goes resident too (same module, just not freed), and with
+    LTX_SKIP_NEG_ENCODE the unused-at-CFG=1 negative prompt is not encoded at all. Both are
+    bit-exact for the positive context: upstream encodes prompts SEQUENTIALLY (one
+    text_encoder.encode per prompt — no batch interaction), and the guider never reads the
+    negative context when cfg_scale == 1.
+    """
 
     def _text_encoder_ctx(self):
         if not hasattr(self, "_resident_te"):
             self._resident_te = self._build_text_encoder()
         return contextlib.nullcontext(self._resident_te)
+
+    def __call__(self, prompts, *, enhance_first_prompt=False, enhance_prompt_image=None,
+                 enhance_prompt_seed=42):
+        skip_neg = _SKIP_NEG_NOW["on"] and isinstance(prompts, list) and len(prompts) == 2
+        if skip_neg:
+            prompts = prompts[:1]
+        with self._text_encoder_ctx() as text_encoder:
+            if enhance_first_prompt:
+                from ltx_pipelines.utils.blocks import generate_enhanced_prompt
+                prompts = list(prompts)
+                prompts[0] = generate_enhanced_prompt(
+                    text_encoder, prompts[0], enhance_prompt_image, seed=enhance_prompt_seed)
+            raw_outputs = [text_encoder.encode(p) for p in prompts]
+        if not hasattr(self, "_resident_ep"):
+            self._resident_ep = self._build_embeddings_processor()
+        outs = [self._resident_ep.process_hidden_states(hs, mask) for hs, mask in raw_outputs]
+        if skip_neg:
+            outs = [outs[0], outs[0]]  # negative ctx is never read at cfg=1
+        return outs
 
 
 def _resolve_repo() -> str:
@@ -274,6 +396,36 @@ class OnGPUFp8GemmaBuilder(base.PrequantCausalGemmaBuilder):
         return te
 
 
+def _warmup_generation():
+    """v8.7 F-1: one full prod-shape generation inside init. Absorbs cudnn/cublas autotune,
+    lazy CUDA init, stage builds (and thus tail residency) before the first real job —
+    first-job exec drops from ~24-30s to steady ~12-16s; the cost moves into init where
+    the worker was idle anyway. Real jobs serialize behind _INIT_LOCK."""
+    import shutil
+    import time as _t
+    _kill_prewarm()
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "warmup.jpg")
+    shutil.copyfile(src, _IN / "warmup")
+    _SIGMA_MODE["mode"] = "distilled"
+    _SIGMA_MODE["override"] = None
+    base.STAGE_2_DISTILLED_SIGMAS = _STAGE2_FAST
+    os.environ["LTX_NO_AUDIO"] = "1"
+    _SKIP_NEG_NOW["on"] = SKIP_NEG_ENCODE
+    case = {"id": "warmup", "file": "warmup", "prompt": DEFAULT_PROMPT, "seed": 3102}
+    settings = {"width": 1280, "height": 704, "frames": 121, "fps": 24.0,
+                "conditioning_strength": 0.8, "conditioning_crf": 0,
+                "dev_inference_steps": FAST_DEFAULT_STEPS}
+    t0 = _t.time()
+    rec = base.run_case(_PIPE, case, settings, _tier_args("fast", "warmup"),
+                        repeat_idx=1, prompt_cache=None, resident_stage_cache=_STAGE_CACHE)
+    if rec.get("error"):
+        raise RuntimeError(f"warmup run_case error: {str(rec['error'])[:300]}")
+    out = _OUT / rec["output"]
+    if os.path.exists(out):
+        os.remove(out)
+    _INIT_LOG.append(f"warmup-gen ok in {_t.time() - t0:.1f}s; timers={rec.get('timers')}")
+
+
 def _init():
     """Idempotent, thread-safe init. Called eagerly from a daemon thread at process start
     (H-1) and again by every handler invocation (no-op once done; blocks while in-flight)."""
@@ -339,6 +491,13 @@ def _init():
             pipe.prompt_encoder = enc
             _PIPE = pipe
             _INIT_LOG.append("pipeline built — ready")
+            if WARMUP_GEN:
+                try:
+                    _warmup_generation()
+                    _mark("warmup_gen_done")
+                except Exception as exc:  # noqa: BLE001
+                    _INIT_LOG.append(f"warmup-gen FAILED (non-fatal): {exc!r}")
+                    _mark("warmup_gen_failed")
             _mark("ready")
         except Exception:
             _INIT_ERR = "INIT LOG:\n" + "\n".join(_INIT_LOG) + "\n\nTRACEBACK:\n" + traceback.format_exc()
@@ -383,6 +542,21 @@ def handler(job):
             tier = "fast"
         audio_on = bool(inp.get("audio", False))  # H-3 (owner-approved 2026-06-11): audio off by default, −3.3s
         steps = int(inp.get("steps", FAST_DEFAULT_STEPS if tier == "fast" else 16))
+        sig = inp.get("sigmas")  # explicit stage1 grid, fast tier only (sigma-sweep lever)
+        if sig is not None:
+            if tier != "fast":
+                return {"error": "sigmas supported on fast tier only", "config_tag": f"{CONFIG_TAG}-{tier}"}
+            try:
+                sig = [float(x) for x in sig]
+            except (TypeError, ValueError):
+                return {"error": "sigmas must be a list of floats", "config_tag": f"{CONFIG_TAG}-{tier}"}
+            ok = (6 <= len(sig) <= 34 and abs(sig[-1]) < 1e-9 and 0.9 <= sig[0] <= 1.0
+                  and all(sig[i] > sig[i + 1] for i in range(len(sig) - 1)))
+            if not ok:
+                return {"error": "bad sigmas: need 0.9<=first<=1.0, strictly descending, last 0, len 6..34",
+                        "config_tag": f"{CONFIG_TAG}-{tier}"}
+            sig[-1] = 0.0
+            steps = len(sig) - 1
 
         img_path = _IN / "req"
         with open(img_path, "wb") as f:
@@ -404,6 +578,8 @@ def handler(job):
             torch.cuda.reset_peak_memory_stats()  # keep peak_vram_gib per-request-true
         # per-request config switches (handler is single-threaded)
         _SIGMA_MODE["mode"] = "distilled" if tier == "fast" else "ltx2"
+        _SIGMA_MODE["override"] = sig if tier == "fast" else None
+        _SKIP_NEG_NOW["on"] = SKIP_NEG_ENCODE and tier == "fast" and not audio_on
         base.STAGE_2_DISTILLED_SIGMAS = _STAGE2_FAST if tier == "fast" else _STAGE2_DEFAULT
         if audio_on:
             os.environ.pop("LTX_NO_AUDIO", None)
@@ -416,16 +592,27 @@ def handler(job):
             return {"error": rec["error"], "init_log": _INIT_LOG, "config_tag": f"{CONFIG_TAG}-{tier}"}
         out = _OUT / rec["output"]
         with open(out, "rb") as f:
-            data = base64.b64encode(f.read()).decode()
+            raw = f.read()
         os.remove(out)
-        return {
-            "video_b64": data,
+        resp = {
             "peak_vram_gib": rec.get("peak_vram_gib"),
             "elapsed_seconds": rec.get("elapsed_seconds"),
             "timers": rec.get("timers"),
-            "config_tag": f"{CONFIG_TAG}-{tier}" + ("" if audio_on else "-noaudio"),
+            "config_tag": (f"{CONFIG_TAG}-{tier}" + ("" if audio_on else "-noaudio")
+                           + (f"-sig{steps}" if sig else "")),
             "tier": tier,
         }
+        if S3_ON:
+            try:
+                import uuid
+                url = _s3_put(raw, f"videos/{uuid.uuid4().hex}.mp4", "video/mp4")
+                resp["video_url"] = url
+                resp["video_cdn_url"] = url.replace(".digitaloceanspaces.com", ".cdn.digitaloceanspaces.com")
+            except Exception as exc:  # noqa: BLE001
+                resp["upload_error"] = str(exc)[:300]
+        if not (RETURN_URL_ONLY and resp.get("video_url")):
+            resp["video_b64"] = base64.b64encode(raw).decode()
+        return resp
     except Exception as exc:  # noqa: BLE001
         return {"error": str(exc), "trace": traceback.format_exc()}
 
