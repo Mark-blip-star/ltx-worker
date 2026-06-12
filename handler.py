@@ -90,7 +90,11 @@ FP8_CKPT_NAME = os.environ.get("LTX_FP8_CKPT_NAME", "ltx-2.3-22b-dev-fp8.safeten
 UPS_NAME = os.environ.get("LTX_UPSCALER_NAME", "ltx-2.3-spatial-upscaler-x2-1.1.safetensors")
 LORA_NAME = os.environ.get("LTX_DISTILLED_LORA_NAME", "ltx-2.3-22b-distilled-lora-384-1.1.safetensors")
 GEMMA_FP8_SUBDIR = os.environ.get("LTX_GEMMA_FP8_SUBDIR", "gemma-fp8")
-CONFIG_TAG = os.environ.get("LTX_CONFIG_TAG", "v8")
+# Official HQ recipe fuses the distilled LoRA into stage1 too (default strength there: 0.25).
+# 0 = off = bit-identical to v8.5 behavior; flipping requires a worker restart (fusion at init).
+S1_LORA_STRENGTH = float(os.environ.get("LTX_S1_LORA_STRENGTH", "0"))
+CONFIG_TAG = os.environ.get("LTX_CONFIG_TAG", "v8") + (
+    f"-s1_{S1_LORA_STRENGTH:g}" if S1_LORA_STRENGTH > 0 else "")
 DEFAULT_PROMPT = os.environ.get(
     "LTX_DEFAULT_PROMPT",
     "The rider pedals forward at a steady, even pace, his body rising and dipping slightly with each "
@@ -283,6 +287,9 @@ def _init():
                     spatial_upsampler_path=ups, gemma_root=gemma_fp8, loras=[],
                     quantization=QuantizationPolicy.fp8_scaled_mm(ckpt), torch_compile=False,
                     registry=_REGISTRY,
+                    distilled_lora_stage_1=(
+                        [LoraPathStrengthAndSDOps(lora, S1_LORA_STRENGTH, LTXV_LORA_COMFY_RENAMING_MAP)]
+                        if S1_LORA_STRENGTH > 0 else None),
                 )
                 _mark("pipeline_build_done")
                 return p

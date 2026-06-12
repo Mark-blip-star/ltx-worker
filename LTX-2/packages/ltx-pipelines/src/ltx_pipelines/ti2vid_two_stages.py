@@ -63,6 +63,7 @@ class TI2VidTwoStagesPipeline:
         registry: Registry | None = None,
         torch_compile: bool = False,
         offload_mode: OffloadMode = OffloadMode.NONE,
+        distilled_lora_stage_1: list[LoraPathStrengthAndSDOps] | None = None,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
@@ -82,7 +83,7 @@ class TI2VidTwoStagesPipeline:
             checkpoint_path,
             self.dtype,
             self.device,
-            loras=tuple(loras),
+            loras=(*tuple(loras), *(distilled_lora_stage_1 or ())),
             quantization=quantization,
             registry=registry,
             torch_compile=torch_compile,
