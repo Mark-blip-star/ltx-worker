@@ -93,8 +93,11 @@ GEMMA_FP8_SUBDIR = os.environ.get("LTX_GEMMA_FP8_SUBDIR", "gemma-fp8")
 # Official HQ recipe fuses the distilled LoRA into stage1 too (default strength there: 0.25).
 # 0 = off = bit-identical to v8.5 behavior; flipping requires a worker restart (fusion at init).
 S1_LORA_STRENGTH = float(os.environ.get("LTX_S1_LORA_STRENGTH", "0"))
-CONFIG_TAG = os.environ.get("LTX_CONFIG_TAG", "v8") + (
-    f"-s1_{S1_LORA_STRENGTH:g}" if S1_LORA_STRENGTH > 0 else "")
+# Default stage1 step count for the fast tier; request "steps" still wins. 12 = v8.5 behavior.
+FAST_DEFAULT_STEPS = int(os.environ.get("LTX_FAST_DEFAULT_STEPS", "12"))
+CONFIG_TAG = (os.environ.get("LTX_CONFIG_TAG", "v8")
+              + (f"-s1_{S1_LORA_STRENGTH:g}" if S1_LORA_STRENGTH > 0 else "")
+              + (f"-st{FAST_DEFAULT_STEPS}" if FAST_DEFAULT_STEPS != 12 else ""))
 DEFAULT_PROMPT = os.environ.get(
     "LTX_DEFAULT_PROMPT",
     "The rider pedals forward at a steady, even pace, his body rising and dipping slightly with each "
@@ -121,6 +124,20 @@ class _StageKeyedCache(base.ResidentStageCache):
 
     def key_for(self, graph_key, **_):
         return graph_key
+
+    def get(self, stage, cache_key, **kw):
+        hit = cache_key in self._entries
+        out = super().get(stage, cache_key, **kw)
+        # v8.6.1: with the distilled LoRA fused into stage1 too, no live model shares the
+        # registry's base SD — drop it after each stage build so at most two transformer
+        # copies stay resident (three + activations busts the 94GB H100 NVL).
+        if S1_LORA_STRENGTH > 0 and not hit:
+            _REGISTRY.clear()
+            torch.cuda.empty_cache()
+            _INIT_LOG.append(
+                f"registry cleared after {cache_key} build; "
+                f"cuda_alloc={torch.cuda.memory_allocated() / 2**30:.1f}GiB")
+        return out
 
 
 _REGISTRY = StateDictRegistry()
@@ -365,7 +382,7 @@ def handler(job):
         if tier not in ("fast", "quality"):
             tier = "fast"
         audio_on = bool(inp.get("audio", False))  # H-3 (owner-approved 2026-06-11): audio off by default, −3.3s
-        steps = int(inp.get("steps", 12 if tier == "fast" else 16))
+        steps = int(inp.get("steps", FAST_DEFAULT_STEPS if tier == "fast" else 16))
 
         img_path = _IN / "req"
         with open(img_path, "wb") as f:
