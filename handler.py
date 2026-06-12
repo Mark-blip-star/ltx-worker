@@ -1,4 +1,31 @@
-"""LTX-2.3 RunPod serverless handler v7 — two-tier (fast/quality) + resident Gemma.
+"""LTX-2.3 RunPod serverless handler v8.5 — v8.4 + audio:false default (H-3, owner-approved).
+
+v8.4 (2026-06-11):
+- L-5: real StateDictRegistry into the pipeline + ResidentStageCache (graph_key-only keys —
+  SingleGPUModelBuilder ignores shapes, stock keys would mint 22.6 GiB per resolution) passed
+  into run_case. Kills per-request: stage2 LoRA re-fuse + 22.6 GiB clone, stage1 build/teardown,
+  VAE-encoder x3 re-reads, embeddings-processor re-read. Resident floor ~71-73 GiB -> resolution
+  gate REJECTS >1280x704x121 (bypass would still OOM: floor + fuse transient + activations).
+- L-4: start.sh page-cache prewarm (ckpt-first), handler kills its process group at the first
+  REAL job (warm pings let it run). /tmp/prewarm.pid, setsid leader.
+- trtllm prewarm REMOVED: measurement showed import tensorrt_llm fails on EVERY boot
+  (libpython3.12.so.1.0 unreachable in uv-standalone python) and trtllm_scaled_mm_usable()
+  silently latches the torch._scaled_mm fallback — prod has always run the fallback. Kernel
+  flip only via offline A/B (ldconfig fix exists, see INIT-SPEEDUP-RESEARCH.md). We log the
+  active path at init instead.
+- Per-request torch.cuda.reset_peak_memory_stats so peak_vram_gib stays per-request-true.
+
+v8.0-v8.3 (init-speedup campaign 2026-06-11):
+- L-2: Gemma fp8 shards stream straight to GPU via safe_open(device="cuda") and dequant there
+  (OnGPUFp8GemmaBuilder) — kills the 36 GB read/cast/write disk round-trip (~18-38 s measured).
+  Identical math to the old CPU dequant: (w.fp32 * scale.fp32).bf16, attn pinned to "sdpa"
+  to match from_pretrained's choice.
+- H-1: eager _init() in a daemon thread before runpod.serverless.start; handler serializes
+  on _INIT_LOCK (idempotent). Overlaps init with SDK fitness checks. LTX_EAGER_INIT=0 disables.
+- L-6: Gemma TE build runs in parallel with the TI2VidTwoStagesPipeline build (2 threads).
+- J-1: prewarm_trtllm_scaled_mm() (lazy tensorrt_llm import + fp8 GEMM kernel) inside init.
+- H-7: {"input":{"warm":true}} returns after init without generating — keep-warm ping op.
+- H-2: "[init] t+XX.XXs phase" timing lines on stdout -> HF worker logs.
 
 v7 (optimization campaign 2026-06-10):
 - TIERS via request param "tier":
@@ -22,11 +49,20 @@ import base64
 import contextlib
 import glob
 import os
-import shutil
+import signal
 import tempfile
+import threading
+import time
 import traceback
 import types
 from pathlib import Path
+
+_T0 = time.monotonic()
+
+
+def _mark(phase: str) -> None:
+    print(f"[init] t+{time.monotonic() - _T0:8.2f}s {phase}", flush=True)
+
 
 _CACHE = "/runpod-volume/huggingface-cache" if os.path.isdir("/runpod-volume") else "/app/hfcache"
 os.environ.setdefault("HF_HOME", _CACHE)
@@ -38,21 +74,23 @@ os.environ.setdefault("LTX_TGATE_START_STEP", "10")
 import torch  # noqa: E402
 import runpod  # noqa: E402
 from huggingface_hub import snapshot_download  # noqa: E402
-from safetensors.torch import load_file, save_file  # noqa: E402
+from safetensors import safe_open  # noqa: E402
 import stage_timing_runner as base  # noqa: E402
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps  # noqa: E402
+from ltx_core.loader.registry import StateDictRegistry  # noqa: E402
 from ltx_core.quantization import QuantizationPolicy  # noqa: E402
 from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline  # noqa: E402
 from ltx_pipelines.utils.blocks import PromptEncoder  # noqa: E402
 from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES  # noqa: E402
+
+_mark("imports_done")
 
 WEIGHTS_REPO = os.environ["LTX_WEIGHTS_REPO"]
 FP8_CKPT_NAME = os.environ.get("LTX_FP8_CKPT_NAME", "ltx-2.3-22b-dev-fp8.safetensors")
 UPS_NAME = os.environ.get("LTX_UPSCALER_NAME", "ltx-2.3-spatial-upscaler-x2-1.1.safetensors")
 LORA_NAME = os.environ.get("LTX_DISTILLED_LORA_NAME", "ltx-2.3-22b-distilled-lora-384-1.1.safetensors")
 GEMMA_FP8_SUBDIR = os.environ.get("LTX_GEMMA_FP8_SUBDIR", "gemma-fp8")
-GEMMA_BF16_DIR = os.environ.get("LTX_GEMMA_BF16_DIR", "/app/gemma-bf16")
-CONFIG_TAG = os.environ.get("LTX_CONFIG_TAG", "v7")
+CONFIG_TAG = os.environ.get("LTX_CONFIG_TAG", "v8")
 DEFAULT_PROMPT = os.environ.get(
     "LTX_DEFAULT_PROMPT",
     "The rider pedals forward at a steady, even pace, his body rising and dipping slightly with each "
@@ -67,6 +105,37 @@ _OUT = Path(tempfile.mkdtemp(prefix="ltx_out_"))
 _PIPE = None
 _INIT_ERR = None
 _INIT_LOG = []
+_INIT_LOCK = threading.Lock()
+_GEMMA_DIR = None  # resolved gemma-fp8 snapshot subdir (cache-key/meta only after L-2)
+_FIRST_JOB_SEEN = False
+
+
+class _StageKeyedCache(base.ResidentStageCache):
+    """L-5: key resident transformers by stage only. SingleGPUModelBuilder.build ignores
+    shape/fps/audio kwargs, so one transformer serves every request; the stock key_for
+    would mint a new ~22.6 GiB stage2 entry per (w,h,frames,fps,audio) tuple -> OOM."""
+
+    def key_for(self, graph_key, **_):
+        return graph_key
+
+
+_REGISTRY = StateDictRegistry()
+_STAGE_CACHE = _StageKeyedCache()
+# L-5 residency floor (Gemma 24 + base SD 22.6 + fused stage2 22.6 + small SDs) ≈ 71-73 GiB;
+# 1080p activations + a non-cached fuse transient would bust 94 GiB, so larger jobs are rejected.
+_MAX_PIXELS = 1280 * 704
+_MAX_FRAMES = 121
+
+
+def _kill_prewarm() -> None:
+    """L-4: stop the start.sh page-cache prewarm — a real job owns the disk now."""
+    try:
+        pid = int(Path("/tmp/prewarm.pid").read_text().strip())
+        Path("/tmp/prewarm.pid").unlink(missing_ok=True)  # before killpg: no stale-pid retries
+        os.killpg(pid, signal.SIGTERM)  # setsid leader -> reaps the in-flight cat too
+        _mark(f"prewarm_killed pid={pid}")
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        pass
 # stage2 sigma sets (module-level switch before each run_case; handler is single-threaded)
 _STAGE2_DEFAULT = None  # captured at init from base.STAGE_2_DISTILLED_SIGMAS
 _STAGE2_FAST = torch.tensor([0.909375, 0.6, 0.0])
@@ -118,63 +187,145 @@ def _resolve_repo() -> str:
         return snapshot_download(WEIGHTS_REPO, token=os.environ.get("HF_TOKEN"))
 
 
-def _dequant_gemma_fp8_to_bf16(fp8_dir: str, out_dir: str) -> None:
-    os.makedirs(out_dir, exist_ok=True)
-    for f in sorted(glob.glob(os.path.join(fp8_dir, "*.safetensors"))):
-        sd = load_file(f)
-        out = {}
-        for k, v in sd.items():
-            if k.endswith(".fp8_scale"):
-                continue
-            scale = sd.get(k + ".fp8_scale")
-            out[k] = (v.to(torch.float32) * scale.to(torch.float32)).to(torch.bfloat16) if scale is not None else v
-        save_file(out, os.path.join(out_dir, os.path.basename(f)))
-    for fn in os.listdir(fp8_dir):
-        src = os.path.join(fp8_dir, fn)
-        if os.path.isfile(src) and not fn.endswith(".safetensors"):
-            shutil.copy(src, os.path.join(out_dir, fn))
+class OnGPUFp8GemmaBuilder(base.PrequantCausalGemmaBuilder):
+    """L-2: stream fp8 shards straight to the GPU and dequant there — no disk round-trip.
+
+    Math is identical to the old CPU dequant ((w.fp32 * scale.fp32).bf16) and the resident
+    format is the same bf16, so outputs must match the v7 path bit-for-bit. attn impl is
+    pinned to "sdpa" because from_pretrained auto-selects it while a bare constructor
+    defaults to "eager" — an unpinned mismatch would silently change encoder numerics.
+    """
+
+    def build(self, device=None, dtype=None, **_: object):
+        from accelerate import init_empty_weights
+        from ltx_core.utils import find_matching_file
+        from transformers import Gemma3ForCausalLM
+
+        target = device or torch.device("cuda")
+        t0 = time.perf_counter()
+        model_folder = find_matching_file(self._model_root, "model*.safetensors").parent
+        # config_class.from_pretrained == the exact parsing path from_pretrained uses; it
+        # unwraps the composite Gemma3Config (text+vision) into Gemma3TextConfig — a bare
+        # AutoConfig here hands the composite to the constructor and crashes on vocab_size.
+        cfg = Gemma3ForCausalLM.config_class.from_pretrained(str(model_folder), local_files_only=True)
+        cfg._attn_implementation = "sdpa"
+        with init_empty_weights(include_buffers=False):
+            model = Gemma3ForCausalLM(cfg)
+        # The fp8 checkpoint is the full multimodal Gemma3: keys are language_model.* /
+        # vision_tower.* / multi_modal_projector.*. from_pretrained strips the prefix and
+        # drops non-LM keys for Gemma3ForCausalLM — replicate that here, and skip vision
+        # tensors BEFORE fetching them to the GPU. Every tensor (incl. norms/embeddings)
+        # carries a per-tensor .fp8_scale companion.
+        lm_prefix = "language_model."
+        sd, scales = {}, {}
+        for shard in sorted(glob.glob(os.path.join(str(model_folder), "*.safetensors"))):
+            with safe_open(shard, framework="pt", device=str(target)) as f:
+                for key in f.keys():
+                    if not key.startswith(lm_prefix):
+                        continue
+                    name = key[len(lm_prefix):]
+                    t = f.get_tensor(key)
+                    if name.endswith(".fp8_scale"):
+                        scales[name[: -len(".fp8_scale")]] = t
+                    else:
+                        sd[name] = t
+        for k, s in scales.items():
+            sd[k] = (sd[k].to(torch.float32) * s.to(torch.float32)).to(torch.bfloat16)
+        missing, unexpected = model.load_state_dict(sd, assign=True, strict=False)
+        if unexpected:
+            raise RuntimeError(f"gemma load: unexpected keys {list(unexpected)[:5]}")
+        model.tie_weights()
+        left_meta = [n for n, p in model.named_parameters() if p.device.type == "meta"]
+        if left_meta:
+            raise RuntimeError(f"gemma load: params left on meta after tie: {left_meta[:5]} (missing={list(missing)[:5]})")
+        model = model.to(target).eval()
+        base.sync_cuda()
+        te = base.MetaSafeGemmaTextEncoder(
+            model=model, tokenizer=self._cached_tokenizer, dtype=dtype or torch.bfloat16,
+        ).eval()
+        base.sync_cuda()
+        self.last_build_event = {
+            "builder": "OnGPUFp8GemmaBuilder",
+            "total_seconds": round(time.perf_counter() - t0, 3),
+            "missing_keys_tied": list(missing),
+        }
+        _mark(f"gemma_on_gpu_build_done ({self.last_build_event['total_seconds']}s)")
+        return te
 
 
 def _init():
-    global _PIPE, _INIT_ERR, _STAGE2_DEFAULT
-    if _PIPE is not None or _INIT_ERR is not None:
-        return
-    try:
-        snap = _resolve_repo()
-        ckpt = os.path.join(snap, FP8_CKPT_NAME)
-        ups = os.path.join(snap, UPS_NAME)
-        lora = os.path.join(snap, LORA_NAME)
-        gemma_fp8 = os.path.join(snap, GEMMA_FP8_SUBDIR)
-        for p in (ckpt, ups, lora, gemma_fp8):
-            if not os.path.exists(p):
-                raise FileNotFoundError(f"missing in snapshot {snap}: {p} (have: {os.listdir(snap)})")
-        gemma = GEMMA_BF16_DIR
-        if not os.path.exists(os.path.join(gemma, "config.json")):
-            _INIT_LOG.append("dequantizing fp8 Gemma -> bf16 (one-time)...")
-            _dequant_gemma_fp8_to_bf16(gemma_fp8, gemma)
-        _STAGE2_DEFAULT = base.STAGE_2_DISTILLED_SIGMAS
-        _INIT_LOG.append("building pipeline (fp8 + distilled-LoRA 0.8 + resident bf16 Gemma)...")
-        pipe = TI2VidTwoStagesPipeline(
-            checkpoint_path=ckpt,
-            distilled_lora=[LoraPathStrengthAndSDOps(lora, 0.8, LTXV_LORA_COMFY_RENAMING_MAP)],
-            spatial_upsampler_path=ups, gemma_root=gemma, loras=[],
-            quantization=QuantizationPolicy.fp8_scaled_mm(ckpt), torch_compile=False,
-        )
-        pipe.prompt_encoder = ResidentPromptEncoder(
-            ckpt, gemma, pipe.dtype, pipe.device,
-            text_encoder_builder=base.PrequantCausalGemmaBuilder(model_root=gemma, tokenizer_root=gemma),
-        )
-        _PIPE = pipe
-        _INIT_LOG.append("pipeline built — ready")
-    except Exception:
-        _INIT_ERR = "INIT LOG:\n" + "\n".join(_INIT_LOG) + "\n\nTRACEBACK:\n" + traceback.format_exc()
+    """Idempotent, thread-safe init. Called eagerly from a daemon thread at process start
+    (H-1) and again by every handler invocation (no-op once done; blocks while in-flight)."""
+    global _PIPE, _INIT_ERR, _STAGE2_DEFAULT, _GEMMA_DIR
+    with _INIT_LOCK:
+        if _PIPE is not None or _INIT_ERR is not None:
+            return
+        try:
+            _mark("init_start")
+            snap = _resolve_repo()
+            _mark("snapshot_resolved")
+            ckpt = os.path.join(snap, FP8_CKPT_NAME)
+            ups = os.path.join(snap, UPS_NAME)
+            lora = os.path.join(snap, LORA_NAME)
+            gemma_fp8 = os.path.join(snap, GEMMA_FP8_SUBDIR)
+            for p in (ckpt, ups, lora, gemma_fp8):
+                if not os.path.exists(p):
+                    raise FileNotFoundError(f"missing in snapshot {snap}: {p} (have: {os.listdir(snap)})")
+            _GEMMA_DIR = gemma_fp8
+            _STAGE2_DEFAULT = base.STAGE_2_DISTILLED_SIGMAS
+            gemma_builder = OnGPUFp8GemmaBuilder(model_root=gemma_fp8, tokenizer_root=gemma_fp8)
+
+            def _build_pipe():
+                _mark("pipeline_build_start")
+                p = TI2VidTwoStagesPipeline(
+                    checkpoint_path=ckpt,
+                    distilled_lora=[LoraPathStrengthAndSDOps(lora, 0.8, LTXV_LORA_COMFY_RENAMING_MAP)],
+                    spatial_upsampler_path=ups, gemma_root=gemma_fp8, loras=[],
+                    quantization=QuantizationPolicy.fp8_scaled_mm(ckpt), torch_compile=False,
+                    registry=_REGISTRY,
+                )
+                _mark("pipeline_build_done")
+                return p
+
+            # L-6: Gemma streams to GPU while the transformer SD is read from disk.
+            # LTX_PARALLEL_INIT=0 serializes the loads (rollback knob: concurrent Gemma +
+            # LoRA-fusion spike is the known OOM pattern on smaller cards).
+            from concurrent.futures import ThreadPoolExecutor
+            if os.environ.get("LTX_PARALLEL_INIT", "1") == "1":
+                with ThreadPoolExecutor(max_workers=2) as ex:
+                    f_te = ex.submit(gemma_builder.build, device=torch.device("cuda"), dtype=torch.bfloat16)
+                    f_pipe = ex.submit(_build_pipe)
+                    pipe = f_pipe.result()
+                    te = f_te.result()
+            else:
+                pipe = _build_pipe()
+                te = gemma_builder.build(device=torch.device("cuda"), dtype=torch.bfloat16)
+
+            # Measurement 2026-06-11: import tensorrt_llm fails on every boot (libpython3.12
+            # unreachable in uv-standalone python) and prod has always run torch._scaled_mm.
+            # Log the active path; the kernel flip is gated behind the offline A/B.
+            from ltx_core.quantization.trtllm_scaled_usable import trtllm_scaled_mm_usable
+            _mark(f"scaled_mm_path={'trtllm' if trtllm_scaled_mm_usable() else 'torch_fallback'}")
+
+            enc = ResidentPromptEncoder(
+                ckpt, gemma_fp8, pipe.dtype, pipe.device,
+                registry=_REGISTRY, text_encoder_builder=gemma_builder,
+            )
+            enc._resident_te = te  # pre-seed: first encode skips the build entirely
+            pipe.prompt_encoder = enc
+            _PIPE = pipe
+            _INIT_LOG.append("pipeline built — ready")
+            _mark("ready")
+        except Exception:
+            _INIT_ERR = "INIT LOG:\n" + "\n".join(_INIT_LOG) + "\n\nTRACEBACK:\n" + traceback.format_exc()
+            _mark("init_FAILED")
 
 
 def _tier_args(tier: str, label: str) -> types.SimpleNamespace:
     fast = tier == "fast"
     return types.SimpleNamespace(
         inputs_dir=_IN, outputs_dir=_OUT, trace_root=_OUT, guidance_trace_dir=None, label=label,
-        gemma_root=GEMMA_BF16_DIR, gemma_prequant_root=GEMMA_BF16_DIR, gemma_8bit=False, gemma_cache=False,
+        gemma_root=_GEMMA_DIR, gemma_prequant_root=_GEMMA_DIR, gemma_8bit=False, gemma_cache=False,
         no_tiling=False, attention_type="flash_attention_3", fast_vae=True, tgate_start_step=10,
         cuda_graphs=False, cuda_graph_warmup_calls=1, cuda_graph_clone_outputs=False, cuda_graph_profile_timings=False,
         torch_compile_transformer=False, torch_compile_mode="reduce-overhead", torch_compile_dynamic=False,
@@ -191,15 +342,22 @@ def _tier_args(tier: str, label: str) -> types.SimpleNamespace:
 
 
 def handler(job):
+    global _FIRST_JOB_SEEN
+    if not _FIRST_JOB_SEEN:
+        _FIRST_JOB_SEEN = True
+        _mark("first_job_received")
     _init()
     if _INIT_ERR:
         return {"error": "INIT_FAILED", "trace": _INIT_ERR}
     inp = job.get("input", {})
+    if inp.get("warm"):  # H-7: keep-warm ping — init done, no generation; prewarm keeps running
+        return {"warm": "ok", "config_tag": CONFIG_TAG}
+    _kill_prewarm()  # L-4: a real generation owns the disk from here
     try:
         tier = str(inp.get("tier", "fast")).lower()
         if tier not in ("fast", "quality"):
             tier = "fast"
-        audio_on = bool(inp.get("audio", True))
+        audio_on = bool(inp.get("audio", False))  # H-3 (owner-approved 2026-06-11): audio off by default, −3.3s
         steps = int(inp.get("steps", 12 if tier == "fast" else 16))
 
         img_path = _IN / "req"
@@ -212,6 +370,14 @@ def handler(job):
             "frames": int(inp.get("frames", 121)), "fps": float(inp.get("fps", 24.0)),
             "conditioning_strength": 0.8, "conditioning_crf": 0, "dev_inference_steps": steps,
         }
+        # L-5 gate: resident floor ~71-73 GiB; larger jobs would OOM even uncached
+        # (floor stays + their own 22.6 GiB fuse transient + ~2.3x activations).
+        if settings["width"] * settings["height"] > _MAX_PIXELS or settings["frames"] > _MAX_FRAMES:
+            return {"error": "resolution_gated",
+                    "max": "1280x704x121 (L-5 resident-cache VRAM floor)",
+                    "config_tag": f"{CONFIG_TAG}-{tier}"}
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()  # keep peak_vram_gib per-request-true
         # per-request config switches (handler is single-threaded)
         _SIGMA_MODE["mode"] = "distilled" if tier == "fast" else "ltx2"
         base.STAGE_2_DISTILLED_SIGMAS = _STAGE2_FAST if tier == "fast" else _STAGE2_DEFAULT
@@ -221,7 +387,7 @@ def handler(job):
             os.environ["LTX_NO_AUDIO"] = "1"
 
         rec = base.run_case(_PIPE, case, settings, _tier_args(tier, "req"),
-                            repeat_idx=1, prompt_cache=None, resident_stage_cache=None)
+                            repeat_idx=1, prompt_cache=None, resident_stage_cache=_STAGE_CACHE)
         if rec.get("error"):
             return {"error": rec["error"], "init_log": _INIT_LOG, "config_tag": f"{CONFIG_TAG}-{tier}"}
         out = _OUT / rec["output"]
@@ -241,4 +407,6 @@ def handler(job):
 
 
 if os.environ.get("LTX_SKIP_START") != "1":
+    if os.environ.get("LTX_EAGER_INIT", "1") == "1":
+        threading.Thread(target=_init, daemon=True, name="eager-init").start()
     runpod.serverless.start({"handler": handler})

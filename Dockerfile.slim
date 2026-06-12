@@ -6,7 +6,7 @@
 FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 \
-    CUDA_MODULE_LOADING=EAGER HF_HUB_ENABLE_HF_TRANSFER=1 \
+    CUDA_MODULE_LOADING=LAZY HF_HUB_ENABLE_HF_TRANSFER=1 \
     UV_PYTHON_INSTALL_DIR=/opt/uv-python UV_LINK_MODE=copy
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -39,6 +39,10 @@ COPY warmup.jpg /app/warmup.jpg
 
 # Import smoke-test (CPU-only; catches missing .so + that handler's run_case path imports cleanly)
 RUN cd /app && /app/LTX-2/.venv/bin/python -c "import torch, numpy, PIL, av, OpenImageIO; import ltx_core.loader; import ltx_pipelines.ti2vid_two_stages; import stage_timing_runner; print('IMPORT SMOKE OK', torch.__version__)"
+
+# I-3: precompile bytecode so cold boots skip py-compile + stat/hash checks
+RUN /app/LTX-2/.venv/bin/python -m compileall -j 0 -q --invalidation-mode unchecked-hash \
+      /app/LTX-2/.venv/lib /app/stage_timing_runner.py /app/handler.py /app/log_uploader.py || true
 
 # Weights repo provided at runtime via RunPod Cached Models (env LTX_WEIGHTS_REPO).
 # handler.py sets HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE / LTX_ATTENTION_TYPE=flash_attention_3 itself.

@@ -1046,7 +1046,12 @@ def run_stage_with_optional_cuda_graphs(  # noqa: PLR0913
     lifecycle_stats: dict[str, Any] | None = None,
     resident_stage_cache: ResidentStageCache | None = None,
 ) -> tuple[Any, Any]:
-    if not args.cuda_graphs and not args.torch_compile_transformer and lifecycle_stats is None:
+    if (
+        not args.cuda_graphs
+        and not args.torch_compile_transformer
+        and lifecycle_stats is None
+        and resident_stage_cache is None
+    ):
         return stage(
             denoiser=denoiser,
             sigmas=sigmas,
@@ -1154,6 +1159,12 @@ def run_stage_with_optional_cuda_graphs(  # noqa: PLR0913
                 graph_transformer.close()
     finally:
         if resident_stage_cache is not None:
+            # Resident transformers would otherwise pin the per-block tgate deltas
+            # (several GiB at full res) across stages and requests; teardown used to
+            # free them implicitly. Drop them — they are write-before-read per run.
+            for m in transformer.modules():
+                m.__dict__.pop("_tgate_video_delta", None)
+                m.__dict__.pop("_tgate_audio_delta", None)
             sync_cuda()
             if lifecycle_stats is not None:
                 lifecycle_stats["teardown_seconds"] = 0.0
