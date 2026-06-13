@@ -199,20 +199,33 @@ class _ResidentDecoder:
         return self._dec.decode_video(latent, tiling_config, generator)
 
 
+# Min free VRAM (GiB) required to KEEP the tail models resident. Resident tail (~3.5 GiB) that
+# also stays live through decode raises the generation peak; on the 94 GB H100 NVL that tips a
+# cold first-job over the ceiling (observed: 93.3 GiB peak -> OOM). H200 (141 GB) has ample room.
+# So pin only when headroom is large; otherwise fall back to the per-job build-and-free tail
+# (v8.6.1 behavior, NVL-safe). Both paths are bit-exact — same weights, same op order.
+TAIL_RESIDENT_MIN_FREE_GIB = float(os.environ.get("LTX_TAIL_RESIDENT_MIN_FREE_GIB", "45"))
+
+
 def _make_tail_resident():
-    """Swap per-call build-and-free tail blocks for resident ones. Bit-exact: same weights,
-    same op order — they just stop being rebuilt and torn down on every job."""
+    """Pin tail blocks resident ONLY when VRAM headroom is large (H200). Bit-exact either way."""
     if _TAIL_RESIDENT["done"] or _PIPE is None:
         return
+    _TAIL_RESIDENT["done"] = True  # decide once; never thrash per job
     try:
+        free_b, total_b = torch.cuda.mem_get_info()
+        free_gib = free_b / 2**30
+        if free_gib < TAIL_RESIDENT_MIN_FREE_GIB:
+            _INIT_LOG.append(
+                f"tail NOT pinned: free={free_gib:.1f}GiB < {TAIL_RESIDENT_MIN_FREE_GIB}GiB "
+                f"(total={total_b / 2**30:.0f}GiB) — per-job tail keeps peak NVL-safe")
+            return
         _PIPE.image_conditioner = _ResidentConditioner(_PIPE.image_conditioner)
         _PIPE.upsampler = _ResidentUpsampler(_PIPE.upsampler)
         _PIPE.video_decoder = _ResidentDecoder(_PIPE.video_decoder)
-        _TAIL_RESIDENT["done"] = True
         _INIT_LOG.append(
-            f"tail resident (vae-enc/upsampler/decoder); cuda_alloc={torch.cuda.memory_allocated() / 2**30:.1f}GiB")
+            f"tail resident (free was {free_gib:.1f}GiB); cuda_alloc={torch.cuda.memory_allocated() / 2**30:.1f}GiB")
     except Exception as exc:  # noqa: BLE001
-        _TAIL_RESIDENT["done"] = True  # don't retry every job
         _INIT_LOG.append(f"tail-resident FAILED, kept per-job path: {exc!r}")
 
 
