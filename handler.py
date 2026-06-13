@@ -95,9 +95,17 @@ GEMMA_FP8_SUBDIR = os.environ.get("LTX_GEMMA_FP8_SUBDIR", "gemma-fp8")
 S1_LORA_STRENGTH = float(os.environ.get("LTX_S1_LORA_STRENGTH", "0"))
 # Default stage1 step count for the fast tier; request "steps" still wins. 12 = v8.5 behavior.
 FAST_DEFAULT_STEPS = int(os.environ.get("LTX_FAST_DEFAULT_STEPS", "12"))
+# Default stage1 sigma grid for the fast tier (JSON list). When set, it replaces the
+# resampled-distilled default and pins step count to len-1; a per-request "sigmas" still wins.
+# Validated through the same path as per-request sigmas. e.g. A13 anchor-preserving grid.
+try:
+    FAST_SIGMAS_DEFAULT = json.loads(os.environ["LTX_FAST_SIGMAS"]) if os.environ.get("LTX_FAST_SIGMAS") else None
+except (ValueError, TypeError):
+    FAST_SIGMAS_DEFAULT = None
 CONFIG_TAG = (os.environ.get("LTX_CONFIG_TAG", "v8")
               + (f"-s1_{S1_LORA_STRENGTH:g}" if S1_LORA_STRENGTH > 0 else "")
-              + (f"-st{FAST_DEFAULT_STEPS}" if FAST_DEFAULT_STEPS != 12 else ""))
+              + (f"-st{FAST_DEFAULT_STEPS}" if FAST_DEFAULT_STEPS != 12 else "")
+              + (f"-fsig{len(FAST_SIGMAS_DEFAULT) - 1}" if FAST_SIGMAS_DEFAULT else ""))
 # v8.7 switches. All default-off so an env-clean v8.7 binary is path-identical to v8.6.1
 # except the always-on bit-exact changes (resident tail, stream-yield decode), gated by PSNR.
 SKIP_NEG_ENCODE = os.environ.get("LTX_SKIP_NEG_ENCODE", "0") == "1"  # bit-exact: prompts encode sequentially
@@ -543,6 +551,8 @@ def handler(job):
         audio_on = bool(inp.get("audio", False))  # H-3 (owner-approved 2026-06-11): audio off by default, −3.3s
         steps = int(inp.get("steps", FAST_DEFAULT_STEPS if tier == "fast" else 16))
         sig = inp.get("sigmas")  # explicit stage1 grid, fast tier only (sigma-sweep lever)
+        if sig is None and tier == "fast" and FAST_SIGMAS_DEFAULT is not None:
+            sig = list(FAST_SIGMAS_DEFAULT)  # env default (e.g. A13); validated below like per-request
         if sig is not None:
             if tier != "fast":
                 return {"error": "sigmas supported on fast tier only", "config_tag": f"{CONFIG_TAG}-{tier}"}
