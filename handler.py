@@ -103,6 +103,15 @@ try:
     FAST_SIGMAS_DEFAULT = json.loads(os.environ["LTX_FAST_SIGMAS"]) if os.environ.get("LTX_FAST_SIGMAS") else None
 except (ValueError, TypeError):
     FAST_SIGMAS_DEFAULT = None
+# v8.8 prompt-enhancement (in-worker Gemma-3 i2v rewriter). All OFF by default => prod bit-exact.
+# LTX_ENHANCE_VISION=1 loads the FULL Gemma3ForConditionalGeneration (vision_tower + projector)
+#   instead of the text-only Gemma3ForCausalLM, so enhance_i2v (image-aware) works. Costs VRAM+init.
+# LTX_ENHANCE=1 makes enhancement the per-request default; request {"enhance": true/false} always wins.
+# LTX_ENHANCE_SYSTEM_PROMPT overrides the shipped gemma_i2v system prompt (e.g. physics-momentum).
+ENHANCE_VISION = os.environ.get("LTX_ENHANCE_VISION", "0") == "1"
+ENHANCE_DEFAULT = os.environ.get("LTX_ENHANCE", "0") == "1"
+ENHANCE_SYS = os.environ.get("LTX_ENHANCE_SYSTEM_PROMPT") or None
+ENHANCE_MAX_TOKENS = int(os.environ.get("LTX_ENHANCE_MAX_TOKENS", "400"))
 CONFIG_TAG = (os.environ.get("LTX_CONFIG_TAG", "v8")
               + (f"-s1_{S1_LORA_STRENGTH:g}" if S1_LORA_STRENGTH > 0 else "")
               + (f"-st{FAST_DEFAULT_STEPS}" if FAST_DEFAULT_STEPS != 12 else "")
@@ -352,6 +361,20 @@ def _resolve_repo() -> str:
         return snapshot_download(WEIGHTS_REPO, token=os.environ.get("HF_TOKEN"))
 
 
+class _VisionGemmaEncoder(base.MetaSafeGemmaTextEncoder):
+    """Full multimodal Gemma (for enhance_i2v). encode() routes through .language_model directly
+    so text-encoding stays bit-exact with the text-only Gemma3ForCausalLM path (same submodule,
+    same weights, same forward) — enabling vision must NOT change generation output."""
+
+    def encode(self, text, padding_side="left"):  # noqa: ARG002
+        token_pairs = self.tokenizer.tokenize_with_weights(text)["gemma"]
+        input_ids = torch.tensor([[t[0] for t in token_pairs]], device=self.model.device)
+        attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=self.model.device)
+        outputs = self.model.model.language_model(
+            input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        return outputs.hidden_states, attention_mask
+
+
 class OnGPUFp8GemmaBuilder(base.PrequantCausalGemmaBuilder):
     """L-2: stream fp8 shards straight to the GPU and dequant there — no disk round-trip.
 
@@ -362,6 +385,8 @@ class OnGPUFp8GemmaBuilder(base.PrequantCausalGemmaBuilder):
     """
 
     def build(self, device=None, dtype=None, **_: object):
+        if ENHANCE_VISION:
+            return self._build_with_vision(device, dtype)
         from accelerate import init_empty_weights
         from ltx_core.utils import find_matching_file
         from transformers import Gemma3ForCausalLM
@@ -415,6 +440,84 @@ class OnGPUFp8GemmaBuilder(base.PrequantCausalGemmaBuilder):
             "missing_keys_tied": list(missing),
         }
         _mark(f"gemma_on_gpu_build_done ({self.last_build_event['total_seconds']}s)")
+        return te
+
+    def _build_with_vision(self, device=None, dtype=None):
+        """v8.8: load the FULL Gemma3ForConditionalGeneration (vision_tower + projector + lm_head)
+        so enhance_i2v (image-aware prompt rewrite) works. Key mapping + computed buffers mirror
+        LTX-2's encoder_configurator (GEMMA_LLM_KEY_OPS + create_and_populate). encode() is
+        overridden to route through .language_model directly => bit-exact with the text-only path."""
+        from accelerate import init_empty_weights
+        from ltx_core.utils import find_matching_file
+        from transformers import AutoImageProcessor, Gemma3Config, Gemma3ForConditionalGeneration, Gemma3Processor
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+        from ltx_core.text_encoders.gemma.config import GEMMA3_CONFIG_FOR_LTX
+
+        target = device or torch.device("cuda")
+        t0 = time.perf_counter()
+        model_folder = find_matching_file(self._model_root, "model*.safetensors").parent
+        gcfg = Gemma3Config.from_dict(GEMMA3_CONFIG_FOR_LTX.to_dict())
+        gcfg._attn_implementation = "sdpa"
+        with init_empty_weights(include_buffers=False):
+            model = Gemma3ForConditionalGeneration(gcfg)
+
+        def remap(k):
+            if k.startswith("language_model.model."):
+                return "model.language_model." + k[len("language_model.model."):]
+            if k.startswith("vision_tower."):
+                return "model.vision_tower." + k[len("vision_tower."):]
+            if k.startswith("multi_modal_projector."):
+                return "model.multi_modal_projector." + k[len("multi_modal_projector."):]
+            return None  # drop language_model.lm_head.* etc; lm_head is duplicated from embed below
+
+        sd, scales = {}, {}
+        for shard in sorted(glob.glob(os.path.join(str(model_folder), "*.safetensors"))):
+            with safe_open(shard, framework="pt", device=str(target)) as f:
+                for key in f.keys():
+                    is_scale = key.endswith(".fp8_scale")
+                    base_key = key[: -len(".fp8_scale")] if is_scale else key
+                    nk = remap(base_key)
+                    if nk is None:
+                        continue
+                    t = f.get_tensor(key)
+                    (scales if is_scale else sd)[nk] = t
+        for k, s in scales.items():
+            if k in sd:
+                sd[k] = (sd[k].to(torch.float32) * s.to(torch.float32)).to(torch.bfloat16)
+        emb = sd.get("model.language_model.embed_tokens.weight")
+        if emb is not None:
+            sd["lm_head.weight"] = emb
+        missing, unexpected = model.load_state_dict(sd, assign=True, strict=False)
+        if unexpected:
+            raise RuntimeError(f"enhance-gemma unexpected keys: {list(unexpected)[:8]}")
+        # computed buffers (mirror encoder_configurator.create_and_populate)
+        v_model = model.model.vision_tower.vision_model
+        l_model = model.model.language_model
+        tcfg = model.config.text_config
+        dim = getattr(tcfg, "head_dim", tcfg.hidden_size // tcfg.num_attention_heads)
+        local_rope = 1.0 / (tcfg.rope_local_base_freq ** (torch.arange(0, dim, 2, dtype=torch.int64).to(torch.float) / dim))
+        inv_freqs, _ = ROPE_INIT_FUNCTIONS[tcfg.rope_scaling["rope_type"]](tcfg)
+        plen = len(v_model.embeddings.position_ids[0])
+        v_model.embeddings.register_buffer("position_ids", torch.arange(plen, dtype=torch.long).unsqueeze(0))
+        l_model.embed_tokens.register_buffer("embed_scale", torch.tensor(tcfg.hidden_size ** 0.5))
+        l_model.rotary_emb_local.register_buffer("inv_freq", local_rope)
+        l_model.rotary_emb.register_buffer("inv_freq", inv_freqs)
+        left_meta = [n for n, p in model.named_parameters() if p.device.type == "meta"]
+        if left_meta:
+            raise RuntimeError(f"enhance-gemma params left on meta: {left_meta[:5]} (missing={list(missing)[:5]})")
+        model = model.to(target).eval()
+        base.sync_cuda()
+        proc_root = str(find_matching_file(self._model_root, "preprocessor_config.json").parent)
+        image_processor = AutoImageProcessor.from_pretrained(proc_root, local_files_only=True)
+        processor = Gemma3Processor(image_processor=image_processor, tokenizer=self._cached_tokenizer.tokenizer)
+        te = _VisionGemmaEncoder(model=model, tokenizer=self._cached_tokenizer, processor=processor,
+                                 dtype=dtype or torch.bfloat16).eval()
+        base.sync_cuda()
+        self.last_build_event = {"builder": "OnGPUFp8GemmaBuilder+vision",
+                                 "total_seconds": round(time.perf_counter() - t0, 3),
+                                 "vram_gib": round(torch.cuda.memory_allocated() / 2**30, 2)}
+        _mark(f"gemma_vision_build_done ({self.last_build_event['total_seconds']}s, "
+              f"{self.last_build_event['vram_gib']}GiB)")
         return te
 
 
@@ -546,6 +649,19 @@ def _tier_args(tier: str, label: str) -> types.SimpleNamespace:
     )
 
 
+def _enhance_prompt(prompt: str, img_path) -> str:
+    """In-worker Gemma-3 i2v prompt rewrite (image-aware). Requires ENHANCE_VISION (full Gemma)."""
+    from PIL import Image
+    te = _PIPE.prompt_encoder._resident_te
+    img = Image.open(img_path).convert("RGB")
+    w, h = img.size
+    scale = 896 / max(w, h)
+    if scale < 1.0:
+        img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))))
+    sysp = ENHANCE_SYS or te.default_gemma_i2v_system_prompt
+    return te.enhance_i2v(prompt, img, system_prompt=sysp, max_new_tokens=ENHANCE_MAX_TOKENS).strip()
+
+
 def handler(job):
     global _FIRST_JOB_SEEN
     if not _FIRST_JOB_SEEN:
@@ -557,6 +673,20 @@ def handler(job):
     inp = job.get("input", {})
     if inp.get("warm"):  # H-7: keep-warm ping — init done, no generation; prewarm keeps running
         return {"warm": "ok", "config_tag": CONFIG_TAG}
+    if inp.get("enhance_probe"):  # diagnostics: confirm vision-Gemma loaded + sample rewrite + VRAM
+        if not ENHANCE_VISION:
+            return {"enhance_probe": "LTX_ENHANCE_VISION not enabled", "config_tag": CONFIG_TAG}
+        try:
+            pp = _IN / "probe"
+            with open(pp, "wb") as f:
+                f.write(base64.b64decode(inp["image_b64"]))
+            out = _enhance_prompt(inp.get("prompt", "two fighters fight"), pp)
+            return {"enhance_probe": "ok", "enhanced": out,
+                    "vram_gib": round(torch.cuda.memory_allocated() / 2**30, 2),
+                    "gemma_build": getattr(_PIPE.prompt_encoder._resident_te, "model", None) is not None,
+                    "config_tag": CONFIG_TAG}
+        except Exception:  # noqa: BLE001
+            return {"enhance_probe": "FAILED", "trace": traceback.format_exc()}
     _kill_prewarm()  # L-4: a real generation owns the disk from here
     try:
         tier = str(inp.get("tier", "fast")).lower()
@@ -587,6 +717,14 @@ def handler(job):
             f.write(base64.b64decode(inp["image_b64"]))
         case = {"id": "req", "file": "req", "prompt": inp.get("prompt") or DEFAULT_PROMPT,
                 "seed": int(inp.get("seed", 3102))}
+        raw_prompt = case["prompt"]
+        enhanced_prompt = None
+        if bool(inp.get("enhance", ENHANCE_DEFAULT)) and ENHANCE_VISION:
+            try:
+                enhanced_prompt = _enhance_prompt(raw_prompt, img_path)
+                case["prompt"] = enhanced_prompt
+            except Exception as exc:  # noqa: BLE001 — graceful fallback to raw prompt
+                _INIT_LOG.append(f"enhance failed, raw used: {exc!r}")
         settings = {
             "width": int(inp.get("width", 1280)), "height": int(inp.get("height", 704)),
             "frames": int(inp.get("frames", 121)), "fps": float(inp.get("fps", 24.0)),
@@ -623,9 +761,12 @@ def handler(job):
             "elapsed_seconds": rec.get("elapsed_seconds"),
             "timers": rec.get("timers"),
             "config_tag": (f"{CONFIG_TAG}-{tier}" + ("" if audio_on else "-noaudio")
-                           + (f"-sig{steps}" if sig else "")),
+                           + (f"-sig{steps}" if sig else "") + ("-enh" if enhanced_prompt else "")),
             "tier": tier,
         }
+        if enhanced_prompt is not None:
+            resp["raw_prompt"] = raw_prompt
+            resp["enhanced_prompt"] = enhanced_prompt
         if S3_ON:
             try:
                 import uuid
