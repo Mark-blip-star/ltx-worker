@@ -506,6 +506,16 @@ class OnGPUFp8GemmaBuilder(base.PrequantCausalGemmaBuilder):
         if left_meta:
             raise RuntimeError(f"enhance-gemma params left on meta: {left_meta[:5]} (missing={list(missing)[:5]})")
         model = model.to(target).eval()
+        # The slim image ships NO C compiler. Gemma3.generate() defaults to a static/"hybrid" KV
+        # cache whose forward is torch.compile'd (Triton -> needs cc) and crashes with
+        # "Failed to find C compiler". Force the eager dynamic cache so enhance never compiles.
+        # (Our video generation never hits this — it runs FA3 + torch._scaled_mm, torch_compile=False.)
+        model.generation_config.cache_implementation = "dynamic"
+        try:
+            import torch._dynamo as _dynamo
+            _dynamo.config.suppress_errors = True  # belt: any stray compile falls back to eager
+        except Exception:  # noqa: BLE001
+            pass
         base.sync_cuda()
         proc_root = str(find_matching_file(self._model_root, "preprocessor_config.json").parent)
         image_processor = AutoImageProcessor.from_pretrained(proc_root, local_files_only=True)
