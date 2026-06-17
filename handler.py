@@ -84,6 +84,19 @@ from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline  # noqa: E40
 from ltx_pipelines.utils.blocks import PromptEncoder  # noqa: E402
 from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES  # noqa: E402
 
+# v8.10 F1 (NATIVE-QUALITY-PLAN root-cause fix): gradient-estimating Euler on stage1.
+# 2nd-order AB2 velocity correction reuses the cached previous-step velocity (NO extra
+# transformer call => 0 wall-time) to stop 1st-order Euler from chording the curved motion
+# band — the root of the snap (frozen->ramp on fountain/mage) + fast-motion blur (samurai).
+# Rebinds the module-default loop in blocks; stage2 is provably inert under GE (2 steps:
+# step0 has no previous_velocity => plain Euler; step1 early-returns at sigma==0). So this
+# is effectively stage1-only. Default OFF (LTX_STAGE1_GE unset) => bit-identical to v8.9.
+if os.environ.get("LTX_STAGE1_GE") == "1":
+    import ltx_pipelines.utils.blocks as _ltx_blocks  # noqa: E402
+    from ltx_pipelines.utils.samplers import gradient_estimating_euler_denoising_loop as _ge_loop  # noqa: E402
+    _ltx_blocks.euler_denoising_loop = _ge_loop
+    _mark("F1 gradient-estimating Euler ON (stage1)")
+
 _mark("imports_done")
 
 WEIGHTS_REPO = os.environ["LTX_WEIGHTS_REPO"]
