@@ -1,4 +1,4 @@
-"""LTX-2.3 RunPod serverless handler v8.5 — v8.4 + audio:false default (H-3, owner-approved).
+"""LTX-2.3 RunPod serverless handler v8.10 — v8.9 + Round-2 quality knobs (env, default bit-exact).
 
 v8.4 (2026-06-11):
 - L-5: real StateDictRegistry into the pipeline + ResidentStageCache (graph_key-only keys —
@@ -182,8 +182,11 @@ _REGISTRY = StateDictRegistry()
 _STAGE_CACHE = _StageKeyedCache()
 # L-5 residency floor (Gemma 24 + base SD 22.6 + fused stage2 22.6 + small SDs) ≈ 71-73 GiB;
 # 1080p activations + a non-cached fuse transient would bust 94 GiB, so larger jobs are rejected.
-_MAX_PIXELS = 1280 * 704
-_MAX_FRAMES = 121
+# v8.10: env-overridable so a test deploy can lift the gate for C5 (1408x768) / H200-1080p
+# WITHOUT a rebuild. Unset => bit-identical default (1280*704 / 121). VRAM caveat still holds:
+# only lift on a card with headroom (H200), never on the 94GB H100 NVL.
+_MAX_PIXELS = int(os.environ.get("LTX_MAX_PIXELS", str(1280 * 704)))
+_MAX_FRAMES = int(os.environ.get("LTX_MAX_FRAMES", "121"))
 
 
 class _ResidentConditioner:
@@ -289,7 +292,26 @@ def _kill_prewarm() -> None:
         pass
 # stage2 sigma sets (module-level switch before each run_case; handler is single-threaded)
 _STAGE2_DEFAULT = None  # captured at init from base.STAGE_2_DISTILLED_SIGMAS
-_STAGE2_FAST = torch.tensor([0.909375, 0.6, 0.0])
+# v8.10 S1 lever: stage2 fast-tier sigmas overridable via env LTX_STAGE2_SIGMAS (JSON list) so a
+# sweep can test the +1-step grid [0.909375, 0.725, 0.421875, 0.0] WITHOUT a rebuild. Unset =>
+# bit-identical default [0.909375, 0.6, 0.0]. Consumed wholesale (only [0] indexed for noise_scale);
+# step count = len(sigmas)-1.
+try:
+    _stage2_env = json.loads(os.environ["LTX_STAGE2_SIGMAS"]) if os.environ.get("LTX_STAGE2_SIGMAS") else None
+except (ValueError, TypeError):
+    _stage2_env = None
+if _stage2_env is not None:
+    _vals = [float(x) for x in _stage2_env]
+    if not (len(_vals) >= 2 and abs(_vals[-1]) < 1e-9
+            and all(_vals[i] > _vals[i + 1] for i in range(len(_vals) - 1))):
+        raise ValueError(f"LTX_STAGE2_SIGMAS must be strictly descending with last==0: {_vals}")
+    _STAGE2_FAST = torch.tensor(_vals)
+else:
+    _STAGE2_FAST = torch.tensor([0.909375, 0.6, 0.0])
+# v8.10: augment CONFIG_TAG with the new knobs (defined here, after _STAGE2_FAST; no NameError)
+CONFIG_TAG += ((f"-mpx{_MAX_PIXELS}" if _MAX_PIXELS != 1280 * 704 else "")
+               + (f"-mfr{_MAX_FRAMES}" if _MAX_FRAMES != 121 else "")
+               + (f"-s2len{len(_STAGE2_FAST)}" if len(_STAGE2_FAST) != 3 else ""))
 
 # stage1 scheduler dispatch: "ltx2" -> real LTX2Scheduler, "distilled" -> resampled official curve
 _SIGMA_MODE = {"mode": "ltx2"}
@@ -755,7 +777,7 @@ def handler(job):
         # (floor stays + their own 22.6 GiB fuse transient + ~2.3x activations).
         if settings["width"] * settings["height"] > _MAX_PIXELS or settings["frames"] > _MAX_FRAMES:
             return {"error": "resolution_gated",
-                    "max": "1280x704x121 (L-5 resident-cache VRAM floor)",
+                    "max": f"{_MAX_PIXELS}px x {_MAX_FRAMES}f (L-5 resident-cache VRAM floor)",
                     "config_tag": f"{CONFIG_TAG}-{tier}"}
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()  # keep peak_vram_gib per-request-true

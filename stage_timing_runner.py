@@ -198,6 +198,14 @@ def override_guider_params(
         value = getattr(args, cli_name)
         if value is not None:
             updates[field_name] = value
+    # v8.10 Round-2 sweep knobs (env-only; CLI flags above take priority). Bit-exact to v8.9
+    # when LTX_STG_BLOCKS / LTX_STG_SCALE unset. Sole STG chokepoint (stage2 = SimpleDenoiser, no guider).
+    _stg_blocks_env = os.environ.get("LTX_STG_BLOCKS")
+    if _stg_blocks_env is not None and "stg_blocks" not in updates:
+        updates["stg_blocks"] = [int(b) for b in json.loads(_stg_blocks_env)]
+    _stg_scale_env = os.environ.get("LTX_STG_SCALE")
+    if _stg_scale_env is not None and "stg_scale" not in updates:
+        updates["stg_scale"] = float(_stg_scale_env)
     return dataclasses.replace(params, **updates) if updates else params
 
 
@@ -1222,6 +1230,17 @@ def _cas_sharpen_chunk(chunk: torch.Tensor, amount: float, mix: float) -> torch.
     return out.permute(0, 2, 3, 1).to(orig_dtype)
 
 
+def _maybe_decode_noise_scale_override() -> None:
+    """v8.10 L5 sweep knob. When LTX_DECODE_NOISE_SCALE is set, override the VAE decoder's
+    class-default decode_noise_scale (read per-instance at decode time). No-op when unset =>
+    bit-exact to v8.9. Idempotent."""
+    raw = os.environ.get("LTX_DECODE_NOISE_SCALE")
+    if raw is None:
+        return
+    from ltx_core.model.video_vae.video_vae import VideoDecoder as _VaeVideoDecoder
+    _VaeVideoDecoder.decode_noise_scale = float(raw)
+
+
 def _maybe_cas(decoded, settings: dict):
     """Wrap the decoded-video iterator (or tensor) with CAS. Default-on; lazy."""
     amount = float(settings.get("cas_amount", _CAS_AMOUNT_DEFAULT))
@@ -1514,6 +1533,7 @@ def run_case(
         )
     record["vram_after"]["stage2_transformer"] = peak_vram_gib()
 
+    _maybe_decode_noise_scale_override()  # v8.10 L5: no-op unless LTX_DECODE_NOISE_SCALE set
     with timed(timers, "video_vae_decode"):
         decoded_video = pipeline.video_decoder(video_state.latent, tiling_config, generator)
     decoded_video = _maybe_cas(decoded_video, settings)  # default-on crispness pass, before encode
