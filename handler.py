@@ -112,10 +112,16 @@ ENHANCE_VISION = os.environ.get("LTX_ENHANCE_VISION", "0") == "1"
 ENHANCE_DEFAULT = os.environ.get("LTX_ENHANCE", "0") == "1"
 ENHANCE_SYS = os.environ.get("LTX_ENHANCE_SYSTEM_PROMPT") or None
 ENHANCE_MAX_TOKENS = int(os.environ.get("LTX_ENHANCE_MAX_TOKENS", "400"))
+# v8.9 CAS (Contrast-Adaptive Sharpen) — DEFAULT-ON post-decode crispness pass (research 2026-06-17:
+#   dominant artifacts = thin-structure dissolve + sharpness collapse on fast motion). Applied to the
+#   pixel chunks before H264 encode in stage_timing_runner (~+0.6s). Tunable; request {"cas_amount":0}
+#   disables for A/B. Defaults live in stage_timing_runner (_CAS_AMOUNT_DEFAULT / _CAS_MIX_DEFAULT).
+CAS_AMOUNT_DEFAULT = float(os.environ.get("LTX_CAS_AMOUNT", "0.6"))
 CONFIG_TAG = (os.environ.get("LTX_CONFIG_TAG", "v8")
               + (f"-s1_{S1_LORA_STRENGTH:g}" if S1_LORA_STRENGTH > 0 else "")
               + (f"-st{FAST_DEFAULT_STEPS}" if FAST_DEFAULT_STEPS != 12 else "")
-              + (f"-fsig{len(FAST_SIGMAS_DEFAULT) - 1}" if FAST_SIGMAS_DEFAULT else ""))
+              + (f"-fsig{len(FAST_SIGMAS_DEFAULT) - 1}" if FAST_SIGMAS_DEFAULT else "")
+              + (f"-cas{CAS_AMOUNT_DEFAULT:g}" if CAS_AMOUNT_DEFAULT > 0 else ""))
 # v8.7 switches. All default-off so an env-clean v8.7 binary is path-identical to v8.6.1
 # except the always-on bit-exact changes (resident tail, stream-yield decode), gated by PSNR.
 SKIP_NEG_ENCODE = os.environ.get("LTX_SKIP_NEG_ENCODE", "0") == "1"  # bit-exact: prompts encode sequentially
@@ -740,6 +746,11 @@ def handler(job):
             "frames": int(inp.get("frames", 121)), "fps": float(inp.get("fps", 24.0)),
             "conditioning_strength": 0.8, "conditioning_crf": 0, "dev_inference_steps": steps,
         }
+        # CAS crispness pass (default-on). Per-request override for A/B; omit in prod => env/default.
+        if "cas_amount" in inp:
+            settings["cas_amount"] = float(inp["cas_amount"])
+        if "cas_mix" in inp:
+            settings["cas_mix"] = float(inp["cas_mix"])
         # L-5 gate: resident floor ~71-73 GiB; larger jobs would OOM even uncached
         # (floor stays + their own 22.6 GiB fuse transient + ~2.3x activations).
         if settings["width"] * settings["height"] > _MAX_PIXELS or settings["frames"] > _MAX_FRAMES:

@@ -1181,6 +1181,63 @@ def run_stage_with_optional_cuda_graphs(  # noqa: PLR0913
     return result
 
 
+# ---------------------------------------------------------------------------
+# CAS (Contrast Adaptive Sharpening) — default-on post-decode crispness pass.
+# Operates on the pixel chunks yielded by the VAE decoder ([f,h,w,c] in [0,1],
+# on GPU) BEFORE H264 encode. Recovers high-frequency detail lost at the motion
+# peak (research 2026-06-17: dominant artifacts = thin-structure dissolve +
+# sharpness collapse on fast motion). FidelityFX CAS, "better diagonals" variant.
+# Lazy generator => cost lands in the encode block, not decode. Tunable per
+# request via settings {cas_amount, cas_mix} or env; defaults applied always.
+# ---------------------------------------------------------------------------
+_CAS_AMOUNT_DEFAULT = float(os.environ.get("LTX_CAS_AMOUNT", "0.6"))   # sharpness lerp(8->5); 0 disables
+_CAS_MIX_DEFAULT = float(os.environ.get("LTX_CAS_MIX", "0.7"))         # out = (1-mix)*orig + mix*cas
+_CAS_SUBBATCH = int(os.environ.get("LTX_CAS_SUBBATCH", "16"))          # frames/CAS call (VRAM cap)
+
+
+def _cas_sharpen_chunk(chunk: torch.Tensor, amount: float, mix: float) -> torch.Tensor:
+    """FidelityFX Contrast-Adaptive Sharpen on a decoded pixel chunk [f,h,w,c] in [0,1]."""
+    if amount <= 0.0:
+        return chunk
+    orig_dtype = chunk.dtype
+    x = chunk.permute(0, 3, 1, 2).float()  # [f,c,h,w]
+    peak = -1.0 / (8.0 - 3.0 * float(amount))  # lerp(8,5,amount)
+    outs = []
+    for s in range(0, x.shape[0], _CAS_SUBBATCH):
+        xb = x[s:s + _CAS_SUBBATCH]
+        p = torch.nn.functional.pad(xb, (1, 1, 1, 1), mode="replicate")
+        a = p[..., :-2, :-2]; b = p[..., :-2, 1:-1]; c = p[..., :-2, 2:]
+        d = p[..., 1:-1, :-2]; e = xb;                f = p[..., 1:-1, 2:]
+        g = p[..., 2:, :-2];   h = p[..., 2:, 1:-1];  i = p[..., 2:, 2:]
+        mn = torch.minimum(torch.minimum(torch.minimum(d, e), torch.minimum(f, b)), h)
+        mn = mn + torch.minimum(mn, torch.minimum(torch.minimum(a, c), torch.minimum(g, i)))
+        mx = torch.maximum(torch.maximum(torch.maximum(d, e), torch.maximum(f, b)), h)
+        mx = mx + torch.maximum(mx, torch.maximum(torch.maximum(a, c), torch.maximum(g, i)))
+        amp = torch.sqrt(torch.clamp(torch.minimum(mn, 2.0 - mx) * torch.reciprocal(mx.clamp_min(1e-5)), 0.0, 1.0))
+        w = amp * peak
+        sharp = (w * (b + d + f + h) + e) * torch.reciprocal(1.0 + 4.0 * w)
+        sharp = ((1.0 - mix) * xb + mix * sharp).clamp_(0.0, 1.0)
+        outs.append(sharp)
+    out = torch.cat(outs, dim=0) if len(outs) > 1 else outs[0]
+    return out.permute(0, 2, 3, 1).to(orig_dtype)
+
+
+def _maybe_cas(decoded, settings: dict):
+    """Wrap the decoded-video iterator (or tensor) with CAS. Default-on; lazy."""
+    amount = float(settings.get("cas_amount", _CAS_AMOUNT_DEFAULT))
+    mix = float(settings.get("cas_mix", _CAS_MIX_DEFAULT))
+    if amount <= 0.0:
+        return decoded
+    if isinstance(decoded, torch.Tensor):
+        return _cas_sharpen_chunk(decoded, amount, mix)
+
+    def _gen():
+        for chunk in decoded:
+            yield _cas_sharpen_chunk(chunk, amount, mix)
+
+    return _gen()
+
+
 @torch.inference_mode()
 def run_case(
     pipeline: TI2VidTwoStagesPipeline,
@@ -1459,6 +1516,7 @@ def run_case(
 
     with timed(timers, "video_vae_decode"):
         decoded_video = pipeline.video_decoder(video_state.latent, tiling_config, generator)
+    decoded_video = _maybe_cas(decoded_video, settings)  # default-on crispness pass, before encode
     record["vram_after"]["video_vae_decode"] = peak_vram_gib()
 
     if audio_state is not None:
