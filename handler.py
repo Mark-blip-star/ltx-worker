@@ -91,11 +91,14 @@ from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES  # noqa: E402
 # Rebinds the module-default loop in blocks; stage2 is provably inert under GE (2 steps:
 # step0 has no previous_velocity => plain Euler; step1 early-returns at sigma==0). So this
 # is effectively stage1-only. Default OFF (LTX_STAGE1_GE unset) => bit-identical to v8.9.
-if os.environ.get("LTX_STAGE1_GE") == "1":
-    import ltx_pipelines.utils.blocks as _ltx_blocks  # noqa: E402
-    from ltx_pipelines.utils.samplers import gradient_estimating_euler_denoising_loop as _ge_loop  # noqa: E402
-    _ltx_blocks.euler_denoising_loop = _ge_loop
-    _mark("F1 gradient-estimating Euler ON (stage1)")
+import ltx_pipelines.utils.blocks as _ltx_blocks  # noqa: E402
+from ltx_pipelines.utils.samplers import (  # noqa: E402
+    euler_denoising_loop as _EULER_LOOP,
+    gradient_estimating_euler_denoising_loop as _GE_LOOP,
+)
+# default loop from env (LTX_STAGE1_GE=1 => GE default); per-request "stage1_ge" overrides below.
+_STAGE1_GE_DEFAULT = os.environ.get("LTX_STAGE1_GE") == "1"
+_DECODE_NOISE_ENV = os.environ.get("LTX_DECODE_NOISE_SCALE") is not None  # preserve env default across requests
 
 _mark("imports_done")
 
@@ -798,7 +801,21 @@ def handler(job):
         _SIGMA_MODE["mode"] = "distilled" if tier == "fast" else "ltx2"
         _SIGMA_MODE["override"] = sig if tier == "fast" else None
         _SKIP_NEG_NOW["on"] = SKIP_NEG_ENCODE and tier == "fast" and not audio_on
-        base.STAGE_2_DISTILLED_SIGMAS = _STAGE2_FAST if tier == "fast" else _STAGE2_DEFAULT
+        # F1 (NATIVE-QUALITY): gradient-estimating Euler on stage1 — per-request, 0 wall-time.
+        ge_on = bool(inp.get("stage1_ge", _STAGE1_GE_DEFAULT))
+        _ltx_blocks.euler_denoising_loop = _GE_LOOP if ge_on else _EULER_LOOP
+        # F2: per-request stage2 sigmas (re-noise/refine grid); else env/default _STAGE2_FAST.
+        _stage2 = _STAGE2_FAST
+        if tier == "fast" and "stage2_sigmas" in inp:
+            v2 = [float(x) for x in inp["stage2_sigmas"]]
+            if len(v2) >= 2 and abs(v2[-1]) < 1e-9 and all(v2[i] > v2[i + 1] for i in range(len(v2) - 1)):
+                _stage2 = torch.tensor(v2)
+        base.STAGE_2_DISTILLED_SIGMAS = _stage2 if tier == "fast" else _STAGE2_DEFAULT
+        # F4: per-request decode renoise grain (single-threaded => env round-trip is safe).
+        if "decode_noise" in inp:
+            os.environ["LTX_DECODE_NOISE_SCALE"] = str(float(inp["decode_noise"]))
+        elif not _DECODE_NOISE_ENV:
+            os.environ.pop("LTX_DECODE_NOISE_SCALE", None)
         if audio_on:
             os.environ.pop("LTX_NO_AUDIO", None)
         else:
@@ -817,7 +834,9 @@ def handler(job):
             "elapsed_seconds": rec.get("elapsed_seconds"),
             "timers": rec.get("timers"),
             "config_tag": (f"{CONFIG_TAG}-{tier}" + ("" if audio_on else "-noaudio")
-                           + (f"-sig{steps}" if sig else "") + ("-enh" if enhanced_prompt else "")),
+                           + (f"-sig{steps}" if sig else "") + ("-enh" if enhanced_prompt else "")
+                           + ("-ge" if ge_on else "") + (f"-s2_{len(_stage2)}" if "stage2_sigmas" in inp else "")
+                           + (f"-dn{inp['decode_noise']}" if "decode_noise" in inp else "")),
             "tier": tier,
         }
         if enhanced_prompt is not None:
