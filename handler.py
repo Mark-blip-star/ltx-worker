@@ -820,8 +820,23 @@ def handler(job):
             os.environ.pop("LTX_NO_AUDIO", None)
         else:
             os.environ["LTX_NO_AUDIO"] = "1"
+        # GUIDANCE (ablation/tier): per-request CFG/modality on the fast tier (costs an uncond pass).
+        # cfg>1 restores classifier-free guidance (drives motion on under-animated scenes like the mage).
+        # cfg_cache amortizes the uncond pass (LTX_CFG_CACHE in denoisers.py): ~+30-40% vs +100%.
+        targs = _tier_args(tier, "req")
+        guided = False
+        if "cfg" in inp:
+            targs.video_cfg_scale = float(inp["cfg"]); guided = float(inp["cfg"]) > 1.0
+        if "modality" in inp:
+            targs.video_modality_scale = float(inp["modality"])
+        if inp.get("cfg_cache"):
+            os.environ["LTX_CFG_CACHE"] = "1"
+            if "cfg_cache_interval" in inp:
+                os.environ["LTX_CFG_CACHE_INTERVAL"] = str(int(inp["cfg_cache_interval"]))
+        else:
+            os.environ.pop("LTX_CFG_CACHE", None)
 
-        rec = base.run_case(_PIPE, case, settings, _tier_args(tier, "req"),
+        rec = base.run_case(_PIPE, case, settings, targs,
                             repeat_idx=1, prompt_cache=None, resident_stage_cache=_STAGE_CACHE)
         if rec.get("error"):
             return {"error": rec["error"], "init_log": _INIT_LOG, "config_tag": f"{CONFIG_TAG}-{tier}"}
@@ -836,7 +851,9 @@ def handler(job):
             "config_tag": (f"{CONFIG_TAG}-{tier}" + ("" if audio_on else "-noaudio")
                            + (f"-sig{steps}" if sig else "") + ("-enh" if enhanced_prompt else "")
                            + ("-ge" if ge_on else "") + (f"-s2_{len(_stage2)}" if "stage2_sigmas" in inp else "")
-                           + (f"-dn{inp['decode_noise']}" if "decode_noise" in inp else "")),
+                           + (f"-dn{inp['decode_noise']}" if "decode_noise" in inp else "")
+                           + (f"-cfg{inp['cfg']}" if "cfg" in inp else "") + ("-cfgcache" if inp.get("cfg_cache") else "")
+                           + (f"-mod{inp['modality']}" if "modality" in inp else "")),
             "tier": tier,
         }
         if enhanced_prompt is not None:
