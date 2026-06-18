@@ -743,7 +743,7 @@ def handler(job):
             return {"enhance_probe": "FAILED", "trace": traceback.format_exc()}
     _kill_prewarm()  # L-4: a real generation owns the disk from here
     try:
-        tier = str(inp.get("tier", "fast")).lower()
+        tier = str(inp.get("tier", os.environ.get("LTX_DEFAULT_TIER", "fast"))).lower()
         if tier not in ("fast", "quality"):
             tier = "fast"
         audio_on = bool(inp.get("audio", False))  # H-3 (owner-approved 2026-06-11): audio off by default, −3.3s
