@@ -773,7 +773,10 @@ def handler(job):
                 "seed": int(inp.get("seed", 3102))}
         raw_prompt = case["prompt"]
         enhanced_prompt = None
-        if bool(inp.get("enhance", ENHANCE_DEFAULT)) and ENHANCE_VISION:
+        # v8.13: prompt upsampler is ALWAYS-ON product default — the per-request `enhance` toggle
+        # is removed (owner decision). It only runs if the vision-Gemma is loaded (LTX_ENHANCE_VISION=1,
+        # prod default); if vision-Gemma is off it gracefully no-ops to the raw prompt.
+        if ENHANCE_VISION:
             try:
                 enhanced_prompt = _enhance_prompt(raw_prompt, img_path)
                 case["prompt"] = enhanced_prompt
