@@ -1,4 +1,11 @@
-"""LTX-2.3 RunPod serverless handler v8.10 — v8.9 + Round-2 quality knobs (env, default bit-exact).
+"""LTX-2.3 RunPod serverless handler v8.18 — v8.17 + t2v prompt enhancement (text-only Gemma rewrite).
+
+v8.18 (2026-07-16):
+- t2v jobs now run the in-worker upsampler too: text-only Gemma enhance_t2v with the official
+  LTX t2v system prompt (raw short prompts at a fixed seed collapsed into one prior scene —
+  the "man chopping food" bug). Env LTX_ENHANCE_T2V=0 is the kill-switch (i2v path untouched);
+  LTX_ENHANCE_T2V_SYSTEM_PROMPT overrides the shipped prompt. Enhancement is seeded from the
+  request seed so re-rolls explore different interpretations.
 
 v8.4 (2026-06-11):
 - L-5: real StateDictRegistry into the pipeline + ResidentStageCache (graph_key-only keys —
@@ -99,6 +106,15 @@ from ltx_pipelines.utils.samplers import (  # noqa: E402
 # default loop from env (LTX_STAGE1_GE=1 => GE default); per-request "stage1_ge" overrides below.
 _STAGE1_GE_DEFAULT = os.environ.get("LTX_STAGE1_GE") == "1"
 _DECODE_NOISE_ENV = os.environ.get("LTX_DECODE_NOISE_SCALE") is not None  # preserve env default across requests
+_CFG_CACHE_ENV = os.environ.get("LTX_CFG_CACHE") == "1"  # same: an endpoint-level LTX_CFG_CACHE=1 must
+# survive requests that omit the per-request "cfg_cache" flag (else the per-request block below would
+# pop it on every such request and the env default never engages — the v8.13 30s-instead-of-Q5 bug).
+# Cache-tuning env defaults (interval/warmup/range), captured so per-request knobs restore them when
+# omitted (single-threaded handler => without this a prior request's tuning leaks to the next).
+_CFG_CACHE_INTERVAL_ENV = os.environ.get("LTX_CFG_CACHE_INTERVAL")
+_CFG_CACHE_WARMUP_ENV = os.environ.get("LTX_CFG_CACHE_WARMUP")
+_CFG_CACHE_RANGE_ENV = os.environ.get("LTX_CFG_CACHE_RANGE")
+_DETAIL_DAEMON_ENV = os.environ.get("LTX_DETAIL_DAEMON")  # preserve env default across requests (v8.15)
 
 _mark("imports_done")
 
@@ -110,6 +126,13 @@ GEMMA_FP8_SUBDIR = os.environ.get("LTX_GEMMA_FP8_SUBDIR", "gemma-fp8")
 # Official HQ recipe fuses the distilled LoRA into stage1 too (default strength there: 0.25).
 # 0 = off = bit-identical to v8.5 behavior; flipping requires a worker restart (fusion at init).
 S1_LORA_STRENGTH = float(os.environ.get("LTX_S1_LORA_STRENGTH", "0"))
+# v8.15 QUALITY EXPERIMENT — optional EXTRA LoRA (e.g. VBVR motion/reasoning), fused at init alongside
+# the distilled LoRA via the same proven path. All unset/0 => no extra LoRA => bit-exact to v8.14.
+# Downloaded from its own HF repo at init only when LTX_EXTRA_LORA_REPO is set. Independent s1/s2 strength.
+EXTRA_LORA_REPO = os.environ.get("LTX_EXTRA_LORA_REPO") or None      # e.g. LiconStudio/Ltx2.3-VBVR-lora-I2V
+EXTRA_LORA_FILE = os.environ.get("LTX_EXTRA_LORA_FILE") or None      # e.g. Ltx2.3-Licon-VBVR-I2V-390K-R32.safetensors
+EXTRA_LORA_S1 = float(os.environ.get("LTX_EXTRA_LORA_S1", "0"))      # stage1 strength
+EXTRA_LORA_S2 = float(os.environ.get("LTX_EXTRA_LORA_S2", "0"))      # stage2 refiner strength
 # Default stage1 step count for the fast tier; request "steps" still wins. 12 = v8.5 behavior.
 FAST_DEFAULT_STEPS = int(os.environ.get("LTX_FAST_DEFAULT_STEPS", "12"))
 # Default stage1 sigma grid for the fast tier (JSON list). When set, it replaces the
@@ -128,6 +151,11 @@ ENHANCE_VISION = os.environ.get("LTX_ENHANCE_VISION", "0") == "1"
 ENHANCE_DEFAULT = os.environ.get("LTX_ENHANCE", "0") == "1"
 ENHANCE_SYS = os.environ.get("LTX_ENHANCE_SYSTEM_PROMPT") or None
 ENHANCE_MAX_TOKENS = int(os.environ.get("LTX_ENHANCE_MAX_TOKENS", "400"))
+# v8.18 t2v enhancement (text-only Gemma rewrite; no image involved). Rides the same ENHANCE_DEFAULT/
+# ENHANCE_VISION gates as i2v (full Gemma has the lm_head that generate() needs). LTX_ENHANCE_T2V=0
+# disables ONLY the t2v rewrite (env-level rollback without an image rollback).
+ENHANCE_T2V = os.environ.get("LTX_ENHANCE_T2V", "1") == "1"
+ENHANCE_T2V_SYS = os.environ.get("LTX_ENHANCE_T2V_SYSTEM_PROMPT") or None
 # v8.9 CAS (Contrast-Adaptive Sharpen) — DEFAULT-ON post-decode crispness pass (research 2026-06-17:
 #   dominant artifacts = thin-structure dissolve + sharpness collapse on fast motion). Applied to the
 #   pixel chunks before H264 encode in stage_timing_runner (~+0.6s). Tunable; request {"cas_amount":0}
@@ -135,6 +163,7 @@ ENHANCE_MAX_TOKENS = int(os.environ.get("LTX_ENHANCE_MAX_TOKENS", "400"))
 CAS_AMOUNT_DEFAULT = float(os.environ.get("LTX_CAS_AMOUNT", "0.6"))
 CONFIG_TAG = (os.environ.get("LTX_CONFIG_TAG", "v8")
               + (f"-s1_{S1_LORA_STRENGTH:g}" if S1_LORA_STRENGTH > 0 else "")
+              + (f"-xlora{EXTRA_LORA_S1:g}_{EXTRA_LORA_S2:g}" if EXTRA_LORA_REPO else "")
               + (f"-st{FAST_DEFAULT_STEPS}" if FAST_DEFAULT_STEPS != 12 else "")
               + (f"-fsig{len(FAST_SIGMAS_DEFAULT) - 1}" if FAST_SIGMAS_DEFAULT else "")
               + (f"-cas{CAS_AMOUNT_DEFAULT:g}" if CAS_AMOUNT_DEFAULT > 0 else ""))
@@ -627,17 +656,34 @@ def _init():
             _STAGE2_DEFAULT = base.STAGE_2_DISTILLED_SIGMAS
             gemma_builder = OnGPUFp8GemmaBuilder(model_root=gemma_fp8, tokenizer_root=gemma_fp8)
 
+            # optional extra quality LoRA (e.g. VBVR), from its own HF repo
+            extra_lora_path = None
+            if EXTRA_LORA_REPO and EXTRA_LORA_FILE:
+                from huggingface_hub import hf_hub_download
+                # v8.16 fix: RunPod cached-model workers force HF_HUB_OFFLINE on, which blocked this
+                # download (v8.15 init crash). Scrub it for the fetch (same trick as log_uploader.py).
+                os.environ.pop("HF_HUB_OFFLINE", None); os.environ.pop("TRANSFORMERS_OFFLINE", None)
+                extra_lora_path = hf_hub_download(EXTRA_LORA_REPO, EXTRA_LORA_FILE)
+                _INIT_LOG.append(f"extra LoRA {EXTRA_LORA_REPO}/{EXTRA_LORA_FILE} s1={EXTRA_LORA_S1} s2={EXTRA_LORA_S2}")
+
             def _build_pipe():
                 _mark("pipeline_build_start")
+                _map = LTXV_LORA_COMFY_RENAMING_MAP
+                stage2_loras = [LoraPathStrengthAndSDOps(lora, 0.8, _map)]
+                stage1_loras = ([LoraPathStrengthAndSDOps(lora, S1_LORA_STRENGTH, _map)]
+                                if S1_LORA_STRENGTH > 0 else [])
+                if extra_lora_path:  # fuse VBVR/etc alongside the distilled LoRA on the requested stages
+                    if EXTRA_LORA_S2 > 0:
+                        stage2_loras.append(LoraPathStrengthAndSDOps(extra_lora_path, EXTRA_LORA_S2, _map))
+                    if EXTRA_LORA_S1 > 0:
+                        stage1_loras.append(LoraPathStrengthAndSDOps(extra_lora_path, EXTRA_LORA_S1, _map))
                 p = TI2VidTwoStagesPipeline(
                     checkpoint_path=ckpt,
-                    distilled_lora=[LoraPathStrengthAndSDOps(lora, 0.8, LTXV_LORA_COMFY_RENAMING_MAP)],
+                    distilled_lora=stage2_loras,
                     spatial_upsampler_path=ups, gemma_root=gemma_fp8, loras=[],
                     quantization=QuantizationPolicy.fp8_scaled_mm(ckpt), torch_compile=False,
                     registry=_REGISTRY,
-                    distilled_lora_stage_1=(
-                        [LoraPathStrengthAndSDOps(lora, S1_LORA_STRENGTH, LTXV_LORA_COMFY_RENAMING_MAP)]
-                        if S1_LORA_STRENGTH > 0 else None),
+                    distilled_lora_stage_1=(stage1_loras or None),
                 )
                 _mark("pipeline_build_done")
                 return p
@@ -703,8 +749,10 @@ def _tier_args(tier: str, label: str) -> types.SimpleNamespace:
     )
 
 
-def _enhance_prompt(prompt: str, img_path) -> str:
-    """In-worker Gemma-3 i2v prompt rewrite (image-aware). Requires ENHANCE_VISION (full Gemma)."""
+def _enhance_prompt(prompt: str, img_path, max_new_tokens=None, system_prompt=None) -> str:
+    """In-worker Gemma-3 i2v prompt rewrite (image-aware). Requires ENHANCE_VISION (full Gemma).
+    max_new_tokens / system_prompt: per-request overrides (v8.16) — let the autonomous loop A/B the
+    upsampler directive (e.g. static-camera single-action) WITHOUT a rebuild. Falls back to env then default."""
     from PIL import Image
     te = _PIPE.prompt_encoder._resident_te
     img = Image.open(img_path).convert("RGB")
@@ -712,8 +760,19 @@ def _enhance_prompt(prompt: str, img_path) -> str:
     scale = 896 / max(w, h)
     if scale < 1.0:
         img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))))
-    sysp = ENHANCE_SYS or te.default_gemma_i2v_system_prompt
-    return te.enhance_i2v(prompt, img, system_prompt=sysp, max_new_tokens=ENHANCE_MAX_TOKENS).strip()
+    sysp = system_prompt or ENHANCE_SYS or te.default_gemma_i2v_system_prompt
+    mnt = int(max_new_tokens) if max_new_tokens else ENHANCE_MAX_TOKENS
+    return te.enhance_i2v(prompt, img, system_prompt=sysp, max_new_tokens=mnt).strip()
+
+
+def _enhance_prompt_t2v(prompt: str, seed: int, max_new_tokens=None, system_prompt=None) -> str:
+    """In-worker Gemma-3 t2v prompt rewrite (v8.18, text-only — no image in the request).
+    Seeded from the request seed so identical prompts with different seeds get different
+    rewrites. Same per-request overrides as i2v (enhance_max_tokens / enhance_system_prompt)."""
+    te = _PIPE.prompt_encoder._resident_te
+    sysp = system_prompt or ENHANCE_T2V_SYS or te.default_gemma_t2v_system_prompt
+    mnt = int(max_new_tokens) if max_new_tokens else ENHANCE_MAX_TOKENS
+    return te.enhance_t2v(prompt, system_prompt=sysp, max_new_tokens=mnt, seed=seed).strip()
 
 
 def handler(job):
@@ -766,26 +825,45 @@ def handler(job):
             sig[-1] = 0.0
             steps = len(sig) - 1
 
+        # v8.17: image_b64 OPTIONAL. Absent => TEXT-TO-VIDEO (no conditioning image); present => i2v.
+        # Same LTX-2.3 model handles both; t2v just passes empty image-conditionings (combined_image_
+        # conditionings(images=[]) -> no conditioning) and skips the vision-enhancer (which needs an image).
+        t2v = not inp.get("image_b64")
         img_path = _IN / "req"
-        with open(img_path, "wb") as f:
-            f.write(base64.b64decode(inp["image_b64"]))
+        if not t2v:
+            with open(img_path, "wb") as f:
+                f.write(base64.b64decode(inp["image_b64"]))
         case = {"id": "req", "file": "req", "prompt": inp.get("prompt") or DEFAULT_PROMPT,
                 "seed": int(inp.get("seed", 3102))}
         raw_prompt = case["prompt"]
         enhanced_prompt = None
-        # v8.13: prompt upsampler is ALWAYS-ON product default — the per-request `enhance` toggle
-        # is removed (owner decision). It only runs if the vision-Gemma is loaded (LTX_ENHANCE_VISION=1,
-        # prod default); if vision-Gemma is off it gracefully no-ops to the raw prompt.
-        if ENHANCE_VISION:
+        # Prompt upsampler is the ALWAYS-ON product default (env LTX_ENHANCE=1 => ENHANCE_DEFAULT=True;
+        # the frontend never sends `enhance`, so it always runs). v8.14 keeps a per-request `enhance:false`
+        # purely as an INTERNAL A/B affordance: a paired sampler A/B (e.g. cfg-cache) needs an identical
+        # prompt across arms, impossible while Gemma samples non-deterministically — so tests bypass it and
+        # feed a fixed pre-enhanced prompt. Not exposed in the product UI; default stays on.
+        enhance_seconds = None  # Phase-0 instrumentation: the ~6-8s upsampler was never measured per-call
+        if (bool(inp.get("enhance", ENHANCE_DEFAULT)) and ENHANCE_VISION
+                and (ENHANCE_T2V or not t2v)):  # t2v rewrite is text-only (v8.18); i2v stays vision-based
             try:
-                enhanced_prompt = _enhance_prompt(raw_prompt, img_path)
+                _t_enh = time.time()
+                if t2v:
+                    enhanced_prompt = _enhance_prompt_t2v(raw_prompt, case["seed"],
+                                                          inp.get("enhance_max_tokens"),
+                                                          inp.get("enhance_system_prompt"))
+                else:
+                    enhanced_prompt = _enhance_prompt(raw_prompt, img_path, inp.get("enhance_max_tokens"),
+                                                      inp.get("enhance_system_prompt"))
+                enhance_seconds = round(time.time() - _t_enh, 2)
                 case["prompt"] = enhanced_prompt
             except Exception as exc:  # noqa: BLE001 — graceful fallback to raw prompt
                 _INIT_LOG.append(f"enhance failed, raw used: {exc!r}")
         settings = {
             "width": int(inp.get("width", 1280)), "height": int(inp.get("height", 704)),
             "frames": int(inp.get("frames", 121)), "fps": float(inp.get("fps", 24.0)),
-            "conditioning_strength": 0.8, "conditioning_crf": 0, "dev_inference_steps": steps,
+            "conditioning_strength": float(inp.get("conditioning_strength", 0.8)),  # v8.16 per-request:
+            "conditioning_crf": 0, "dev_inference_steps": steps,  # lower => subject freer to move (un-freeze)
+            "t2v": t2v,  # v8.17: text-to-video (no conditioning image)
         }
         # CAS crispness pass (default-on). Per-request override for A/B; omit in prod => env/default.
         if "cas_amount" in inp:
@@ -819,6 +897,18 @@ def handler(job):
             os.environ["LTX_DECODE_NOISE_SCALE"] = str(float(inp["decode_noise"]))
         elif not _DECODE_NOISE_ENV:
             os.environ.pop("LTX_DECODE_NOISE_SCALE", None)
+        # v8.15: per-request Detail-Daemon (sampler hook reads LTX_DETAIL_DAEMON*); restore env default
+        # when omitted so it never leaks across requests. Prod (no flag, no env) => off => bit-exact.
+        if "detail_daemon" in inp:
+            os.environ["LTX_DETAIL_DAEMON"] = str(float(inp["detail_daemon"]))
+            for _ek, _ik in (("LTX_DETAIL_DAEMON_START", "detail_daemon_start"),
+                             ("LTX_DETAIL_DAEMON_END", "detail_daemon_end")):
+                if _ik in inp:
+                    os.environ[_ek] = str(int(inp[_ik]))
+                else:
+                    os.environ.pop(_ek, None)
+        elif not _DETAIL_DAEMON_ENV:
+            os.environ.pop("LTX_DETAIL_DAEMON", None)
         if audio_on:
             os.environ.pop("LTX_NO_AUDIO", None)
         else:
@@ -834,10 +924,19 @@ def handler(job):
             targs.video_modality_scale = float(inp["modality"])
         if inp.get("cfg_cache"):
             os.environ["LTX_CFG_CACHE"] = "1"
-            if "cfg_cache_interval" in inp:
-                os.environ["LTX_CFG_CACHE_INTERVAL"] = str(int(inp["cfg_cache_interval"]))
-        else:
+        elif not _CFG_CACHE_ENV:
             os.environ.pop("LTX_CFG_CACHE", None)
+        # per-request cache tuning (interval/warmup/range) for A/B; restore endpoint env default when
+        # a request omits one so tuning never leaks across requests (handler is single-threaded).
+        for _k, _v, _d in (("LTX_CFG_CACHE_INTERVAL", inp.get("cfg_cache_interval"), _CFG_CACHE_INTERVAL_ENV),
+                           ("LTX_CFG_CACHE_WARMUP", inp.get("cfg_cache_warmup"), _CFG_CACHE_WARMUP_ENV),
+                           ("LTX_CFG_CACHE_RANGE", inp.get("cfg_cache_range"), _CFG_CACHE_RANGE_ENV)):
+            if _v is not None:
+                os.environ[_k] = str(_v)
+            elif _d is not None:
+                os.environ[_k] = _d
+            else:
+                os.environ.pop(_k, None)
 
         rec = base.run_case(_PIPE, case, settings, targs,
                             repeat_idx=1, prompt_cache=None, resident_stage_cache=_STAGE_CACHE)
@@ -856,12 +955,21 @@ def handler(job):
                            + ("-ge" if ge_on else "") + (f"-s2_{len(_stage2)}" if "stage2_sigmas" in inp else "")
                            + (f"-dn{inp['decode_noise']}" if "decode_noise" in inp else "")
                            + (f"-cfg{inp['cfg']}" if "cfg" in inp else "") + ("-cfgcache" if inp.get("cfg_cache") else "")
-                           + (f"-mod{inp['modality']}" if "modality" in inp else "")),
+                           + (f"-mod{inp['modality']}" if "modality" in inp else "")
+                           + (f"-dd{inp['detail_daemon']}" if "detail_daemon" in inp else "")),
             "tier": tier,
         }
         if enhanced_prompt is not None:
             resp["raw_prompt"] = raw_prompt
             resp["enhanced_prompt"] = enhanced_prompt
+            # Phase-0 instrumentation: real per-call upsampler cost + output size. enhance_words near
+            # ~300 (≈400-token cap) means the cap binds and trimming to 256 would save time; well below
+            # means EOS already stops short and the A1 trim lever is a no-op. enhance_seconds is THE
+            # measurement that was previously only owner-estimated (~6-8s).
+            resp["enhance_seconds"] = enhance_seconds
+            resp["enhance_words"] = len(enhanced_prompt.split())
+            resp["enhance_chars"] = len(enhanced_prompt)
+            resp["enhance_max_tokens"] = ENHANCE_MAX_TOKENS
         if S3_ON:
             try:
                 import uuid

@@ -1,10 +1,39 @@
 import logging
+import math
+import os
 from dataclasses import replace
 from functools import partial
 from typing import Callable
 
 import torch
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
+
+
+def _detail_daemon_factor(step_idx: int, n_steps: int) -> float:
+    """Detail-Daemon-style under-denoise factor (latent domain). Bell curve over a step window,
+    env-gated => no-op unless LTX_DETAIL_DAEMON>0. Restricted to stage1 (n_steps>5) so the short
+    stage2 refiner is left untouched. Env: LTX_DETAIL_DAEMON (amount), _START/_END (step window)."""
+    amt = float(os.environ.get("LTX_DETAIL_DAEMON", "0") or "0")
+    if amt <= 0.0 or n_steps <= 5:
+        return 0.0
+    start = int(os.environ.get("LTX_DETAIL_DAEMON_START", "0") or "0")
+    end = int(os.environ.get("LTX_DETAIL_DAEMON_END", str(n_steps)) or n_steps)
+    if end <= start or not (start <= step_idx < end):
+        return 0.0
+    t = (step_idx - start) / max(1, end - start - 1)
+    return amt * math.sin(math.pi * t)  # 0 at window ends, peak mid-schedule
+
+
+def _apply_detail_daemon(denoised, noisy, step_idx, n_steps):
+    """Pull the x0 estimate slightly toward the noisy latent on mid steps => the model effectively
+    'under-denoises' => more high-frequency detail survives into later steps (Detail-Daemon mechanism,
+    latent-domain). Targets thin-structure/sharpness without the post-decode double-sharpen of CAS."""
+    f = _detail_daemon_factor(step_idx, n_steps)
+    if f == 0.0 or denoised is None or noisy is None:
+        return denoised
+    return denoised + f * (noisy - denoised)
 
 from ltx_core.components.diffusion_steps import EulerCfgPpDiffusionStep, Res2sDiffusionStep
 from ltx_core.components.protocols import DiffusionStepProtocol
@@ -13,8 +42,6 @@ from ltx_core.utils import to_denoised, to_velocity
 from ltx_pipelines.utils.helpers import post_process_latent, timesteps_from_mask
 from ltx_pipelines.utils.res2s import get_res2s_coefficients
 from ltx_pipelines.utils.types import Denoiser, LatentState
-
-logger = logging.getLogger(__name__)
 
 
 def _step_state(
@@ -69,6 +96,8 @@ def euler_denoising_loop(
         video_result, audio_result = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
         denoised_video = video_result.denoised if video_result is not None else None
         denoised_audio = audio_result.denoised if audio_result is not None else None
+        if video_state is not None and denoised_video is not None:
+            denoised_video = _apply_detail_daemon(denoised_video, video_state.latent, step_idx, len(sigmas) - 1)
 
         video_state = _step_state(video_state, denoised_video, stepper, sigmas, step_idx)
         audio_state = _step_state(audio_state, denoised_audio, stepper, sigmas, step_idx)
@@ -117,6 +146,7 @@ def gradient_estimating_euler_denoising_loop(
         denoised_audio = audio_result.denoised if audio_result is not None else None
 
         if video_state is not None and denoised_video is not None:
+            denoised_video = _apply_detail_daemon(denoised_video, video_state.latent, step_idx, len(sigmas) - 1)
             denoised_video = post_process_latent(denoised_video, video_state.denoise_mask, video_state.clean_latent)
         if audio_state is not None and denoised_audio is not None:
             denoised_audio = post_process_latent(denoised_audio, audio_state.denoise_mask, audio_state.clean_latent)

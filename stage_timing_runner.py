@@ -1312,12 +1312,14 @@ def run_case(
     generator = torch.Generator(device=pipeline.device).manual_seed(case["seed"])
     noiser = GaussianNoiser(generator=generator)
     dtype = torch.bfloat16
-    image = ImageConditioningInput(
+    t2v = bool(settings.get("t2v"))  # v8.17: text-to-video => no conditioning image
+    image = None if t2v else ImageConditioningInput(
         path=str(args.inputs_dir / case["file"]),
         frame_idx=0,
         strength=settings["conditioning_strength"],
         crf=settings["conditioning_crf"],
     )
+    _imgs = [] if t2v else [image]  # empty => combined_image_conditionings returns [] => pure t2v
     tiling_config = None if args.no_tiling else TilingConfig.default()
     chunks = get_video_chunks_number(settings["frames"], tiling_config or TilingConfig.default())
 
@@ -1325,7 +1327,7 @@ def run_case(
         return pipeline.prompt_encoder(
             [case["prompt"], DEFAULT_NEGATIVE_PROMPT],
             enhance_first_prompt=False,
-            enhance_prompt_image=image.path,
+            enhance_prompt_image=(None if t2v else image.path),
             enhance_prompt_seed=case["seed"],
         )
 
@@ -1337,7 +1339,7 @@ def run_case(
             prompt_key = prompt_cache.key(
                 prompt=case["prompt"],
                 negative_prompt=DEFAULT_NEGATIVE_PROMPT,
-                image_path=Path(image.path),
+                image_path=(Path(image.path) if image else None),
                 seed=case["seed"],
                 gemma_root=args.gemma_root,
                 gemma_8bit=args.gemma_8bit,
@@ -1362,7 +1364,7 @@ def run_case(
     with timed(timers, "stage1_image_conditioner"):
         stage_1_conditionings = pipeline.image_conditioner(
             lambda enc: combined_image_conditionings(
-                images=[image],
+                images=_imgs,
                 height=stage_1_output_shape.height,
                 width=stage_1_output_shape.width,
                 video_encoder=enc,
@@ -1489,7 +1491,7 @@ def run_case(
     with timed(timers, "stage2_image_conditioner"):
         stage_2_conditionings = pipeline.image_conditioner(
             lambda enc: combined_image_conditionings(
-                images=[image],
+                images=_imgs,
                 height=settings["height"],
                 width=settings["width"],
                 video_encoder=enc,
