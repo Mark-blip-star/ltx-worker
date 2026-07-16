@@ -1,4 +1,12 @@
-"""LTX-2.3 RunPod serverless handler v8.18 — v8.17 + t2v prompt enhancement (text-only Gemma rewrite).
+"""LTX-2.3 RunPod serverless handler v8.19 — v8.17 + t2v prompt enhancement (text-only Gemma rewrite).
+
+v8.19 (2026-07-16):
+- Terminate the phrase handed to the upsampler. Upstream's enhance_t2v frames the user turn as
+  "user prompt: <text>" with no terminator, so Gemma completes the open phrase instead of (or
+  before) answering: "football player" -> "and a football on a field." + EOS. Closing it fixes
+  the rewrite on every seed measured (8/8 clean vs 1/8 junk-only + 2/8 junk-prefixed).
+- Belts, because sampling stays stochastic and a bad rewrite REPLACES the user's prompt:
+  re-roll a degenerate (<40 word) draw, then fall back to the raw prompt; strip leading junk.
 
 v8.18 (2026-07-16):
 - t2v jobs now run the in-worker upsampler too: text-only Gemma enhance_t2v with the official
@@ -57,6 +65,7 @@ import contextlib
 import glob
 import json
 import os
+import re
 import signal
 import tempfile
 import threading
@@ -156,6 +165,11 @@ ENHANCE_MAX_TOKENS = int(os.environ.get("LTX_ENHANCE_MAX_TOKENS", "400"))
 # disables ONLY the t2v rewrite (env-level rollback without an image rollback).
 ENHANCE_T2V = os.environ.get("LTX_ENHANCE_T2V", "1") == "1"
 ENHANCE_T2V_SYS = os.environ.get("LTX_ENHANCE_T2V_SYSTEM_PROMPT") or None
+# Degenerate-rewrite guard (see _enhance_prompt_t2v): re-roll a too-short rewrite, then give up
+# and use the raw prompt. 40 words is well under a real rewrite (~125-210) and well over the
+# junk draws (2-6). Each retry costs ~8s of upsampler on an otherwise ~25-45s job.
+ENHANCE_T2V_TRIES = int(os.environ.get("LTX_ENHANCE_T2V_TRIES", "2"))
+ENHANCE_T2V_MIN_WORDS = int(os.environ.get("LTX_ENHANCE_T2V_MIN_WORDS", "40"))
 # v8.9 CAS (Contrast-Adaptive Sharpen) — DEFAULT-ON post-decode crispness pass (research 2026-06-17:
 #   dominant artifacts = thin-structure dissolve + sharpness collapse on fast motion). Applied to the
 #   pixel chunks before H264 encode in stage_timing_runner (~+0.6s). Tunable; request {"cas_amount":0}
@@ -765,14 +779,51 @@ def _enhance_prompt(prompt: str, img_path, max_new_tokens=None, system_prompt=No
     return te.enhance_i2v(prompt, img, system_prompt=sysp, max_new_tokens=mnt).strip()
 
 
+# Leading junk the upsampler can emit (v8.19): _enhance slices the output at the PADDED input
+# length, so up to 7 leading tokens are eaten and a bare ". " / "*" is left behind; and a
+# completion fragment can still slip in front of the real rewrite. Every real rewrite opens with
+# a capital ("Style: ...", "A young ...", "In a medium close-up ..."), so a lowercase opening
+# sentence is junk by construction. Bounded quantifiers — this runs on model output.
+_LEADING_PUNCT_RE = re.compile(r'^[\s.,;:*"\'\-—]+')
+# The inner alternation lets a fragment cross punctuation inside quotes (knight says "For the
+# kingdom!"); LAZY so it ends at the FIRST sentence boundary — greedy ate the real answer too.
+_LEADING_FRAGMENT_RE = re.compile(r'^[a-z](?:[^.!?]|[.!?](?=["\')])){0,200}?[.!?]+["\')\]]*\s+(?=[A-Z*])')
+
+
+def _strip_leading_junk(text: str) -> str:
+    out = _LEADING_PUNCT_RE.sub("", text)
+    out = _LEADING_FRAGMENT_RE.sub("", out)
+    return _LEADING_PUNCT_RE.sub("", out).strip()
+
+
 def _enhance_prompt_t2v(prompt: str, seed: int, max_new_tokens=None, system_prompt=None) -> str:
     """In-worker Gemma-3 t2v prompt rewrite (v8.18, text-only — no image in the request).
     Seeded from the request seed so identical prompts with different seeds get different
-    rewrites. Same per-request overrides as i2v (enhance_max_tokens / enhance_system_prompt)."""
+    rewrites. Same per-request overrides as i2v (enhance_max_tokens / enhance_system_prompt).
+
+    v8.19 TERMINATOR: upstream's enhance_t2v frames the user turn as "user prompt: <text>" with
+    NO terminator, leaving an open phrase — so Gemma COMPLETES it before (or instead of)
+    answering: "football player" -> "and a football on a field." + EOS (6 words), or
+    "red dragon" -> "and knight fighting in a forest, knight says \"For the kingdom!\"" glued in
+    front of the real rewrite, dragging a knight into the video. enhance_i2v does not show this
+    — its framing ends in "." — and closing the phrase here fixes it: measured on the exact seed
+    that returned 6 words of junk, "football player." returns a clean 162-word rewrite.
+    Retry guard stays as a belt: sampling is stochastic, and a fragment REPLACES the user's
+    prompt, so a too-short draw is worse than no rewrite at all."""
     te = _PIPE.prompt_encoder._resident_te
     sysp = system_prompt or ENHANCE_T2V_SYS or te.default_gemma_t2v_system_prompt
     mnt = int(max_new_tokens) if max_new_tokens else ENHANCE_MAX_TOKENS
-    return te.enhance_t2v(prompt, system_prompt=sysp, max_new_tokens=mnt, seed=seed).strip()
+    closed = prompt.strip()
+    if closed and closed[-1] not in ".!?…\"')":
+        closed += "."
+    for attempt in range(ENHANCE_T2V_TRIES):
+        out = te.enhance_t2v(closed, system_prompt=sysp, max_new_tokens=mnt,
+                             seed=seed + attempt * 7919).strip()  # prime stride => independent draws
+        out = _strip_leading_junk(out)
+        if len(out.split()) >= ENHANCE_T2V_MIN_WORDS:
+            return out
+        _INIT_LOG.append(f"t2v enhance degenerate ({len(out.split())}w) on try {attempt + 1}: {out[:80]!r}")
+    return prompt  # raw prompt beats a fragment that would replace it
 
 
 def handler(job):
