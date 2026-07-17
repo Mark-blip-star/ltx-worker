@@ -34,7 +34,13 @@ RUN curl -fSL -o /tmp/flash_attn_3-3.0.0-cp310-abi3-linux_x86_64.whl \
 # (imported only when LTX_MEME=1), so the regular video endpoint stays bit-exact.
 # onnxruntime-gpu pinned to the last CUDA-12 line: 1.21+ links libcudart.so.13 (CUDA 13)
 # and dies on import inside this cu12.6 image (caught by the smoke test below).
-RUN uv pip install --python "$VENV/bin/python" "onnxruntime-gpu==1.20.1" opencv-python-headless && uv cache clean
+# v8.23: insightface for the face-restore post-pass (LTX_FACE_RESTORE; identity of realistic
+# faces cannot survive pose-driven regeneration otherwise — frame 0 is the photo, later frames
+# reinvent the face). --no-deps + explicit light deps so it can't downgrade numpy/opencv.
+RUN uv pip install --python "$VENV/bin/python" "onnxruntime-gpu==1.20.1" opencv-python-headless && \
+    uv pip install --python "$VENV/bin/python" --no-deps insightface && \
+    uv pip install --python "$VENV/bin/python" onnx prettytable easydict scikit-image && \
+    uv cache clean
 
 # --- app code (hot layer: changes here don't rebuild venv) ---
 COPY stage_timing_runner.py /app/stage_timing_runner.py
@@ -45,7 +51,7 @@ COPY warmup.jpg /app/warmup.jpg
 COPY dwpose_vendor /app/dwpose_vendor
 
 # Import smoke-test (CPU-only; catches missing .so + that handler's run_case path imports cleanly)
-RUN cd /app && /app/LTX-2/.venv/bin/python -c "import torch, numpy, PIL, av, OpenImageIO; import ltx_core.loader; import ltx_pipelines.ti2vid_two_stages, ltx_pipelines.iclora_utils; import stage_timing_runner; import dwpose_vendor; print('IMPORT SMOKE OK', torch.__version__)"
+RUN cd /app && /app/LTX-2/.venv/bin/python -c "import torch, numpy, PIL, av, OpenImageIO; import ltx_core.loader; import ltx_pipelines.ti2vid_two_stages, ltx_pipelines.iclora_utils; import stage_timing_runner; import dwpose_vendor; from insightface.app import FaceAnalysis; print('IMPORT SMOKE OK', torch.__version__)"
 
 # I-3: precompile bytecode so cold boots skip py-compile + stat/hash checks
 RUN /app/LTX-2/.venv/bin/python -m compileall -j 0 -q --invalidation-mode unchecked-hash \

@@ -191,6 +191,14 @@ ENHANCE_T2V_MIN_WORDS = int(os.environ.get("LTX_ENHANCE_T2V_MIN_WORDS", "40"))
 # v8.22: retarget the meme skeleton into the character photo's composition (see
 # _pose_control_video). Per-request "retarget": false for A/B; env kill-switch here.
 MEME_RETARGET = os.environ.get("LTX_MEME_RETARGET", "1") == "1"
+# v8.23 FACE RESTORE: pose-driven regeneration cannot preserve a specific real face — frame 0
+# is the photo, later frames reinvent it. Post-pass swaps the source face back onto every
+# frame (insightface buffalo_l + inswapper_128). OFF by default: inswapper's license is
+# research/non-commercial — enabling in prod is the owner's call. Cartoons auto-skip (no face).
+FACE_RESTORE = os.environ.get("LTX_FACE_RESTORE", "0") == "1"
+FACE_SWAP_REPO = os.environ.get("LTX_FACE_SWAP_REPO", "ezioruan/inswapper_128.onnx")
+FACE_SWAP_FILE = os.environ.get("LTX_FACE_SWAP_FILE", "inswapper_128.onnx")
+_FACE = {"app": None, "swapper": None}
 # v8.9 CAS (Contrast-Adaptive Sharpen) — DEFAULT-ON post-decode crispness pass (research 2026-06-17:
 #   dominant artifacts = thin-structure dissolve + sharpness collapse on fast motion). Applied to the
 #   pixel chunks before H264 encode in stage_timing_runner (~+0.6s). Tunable; request {"cas_amount":0}
@@ -728,6 +736,22 @@ def _init():
                 from dwpose_vendor import DWposeDetector
                 _DWPOSE["det"] = DWposeDetector(model_det=det_onnx, model_pose=pose_onnx, device="cuda")
                 _INIT_LOG.append("dwpose ready (meme mode)")
+                if FACE_RESTORE:  # v8.23: source-face swap-back pass (see FACE_RESTORE note)
+                    import huggingface_hub.constants as _hfc23
+                    _prev23 = _hfc23.HF_HUB_OFFLINE
+                    _hfc23.HF_HUB_OFFLINE = False
+                    try:
+                        swap_onnx = hf_hub_download(FACE_SWAP_REPO, FACE_SWAP_FILE)
+                    finally:
+                        _hfc23.HF_HUB_OFFLINE = _prev23
+                    os.environ.setdefault("INSIGHTFACE_HOME", "/runpod-volume/insightface")
+                    from insightface.app import FaceAnalysis
+                    from insightface.model_zoo import get_model
+                    fa = FaceAnalysis(name="buffalo_l", providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+                    fa.prepare(ctx_id=0, det_size=(640, 640))
+                    _FACE["app"] = fa
+                    _FACE["swapper"] = get_model(swap_onnx, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+                    _INIT_LOG.append("face-restore ready (buffalo_l + inswapper)")
 
             def _build_pipe():
                 _mark("pipeline_build_start")
@@ -1024,6 +1048,57 @@ def _pose_control_video(src_path, char_path, width: int, height: int, n_frames: 
     return out_path, mode
 
 
+def _face_restore(video_bytes: bytes, char_path) -> tuple:
+    """v8.23: swap the SOURCE face back onto every generated frame. Pose-driven regeneration
+    reinvents a real person's face after frame 0; this restores pixel-level identity while
+    keeping LTX's motion/lighting. Returns (bytes, status). No face on either side => no-op."""
+    import io
+
+    import av
+    import cv2
+    import numpy as np
+
+    fa, swapper = _FACE["app"], _FACE["swapper"]
+    src = cv2.imread(str(char_path))
+    if src is None:
+        return video_bytes, "skipped_bad_source"
+    src_faces = fa.get(src)
+    if not src_faces:
+        return video_bytes, "skipped_no_source_face"  # cartoons land here by design
+    src_face = max(src_faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+
+    vin = av.open(io.BytesIO(video_bytes))
+    vstream = vin.streams.video[0]
+    fps = float(vstream.average_rate) if vstream.average_rate else 24.0
+    buf = io.BytesIO()
+    out = av.open(buf, "w", format="mp4")
+    ostream = out.add_stream("libx264", rate=round(fps))
+    ostream.width = vstream.codec_context.width
+    ostream.height = vstream.codec_context.height
+    ostream.pix_fmt = "yuv420p"
+    ostream.options = {"crf": "18", "preset": "medium"}
+    swapped = 0
+    try:
+        for frame in vin.decode(vstream):
+            bgr = frame.to_ndarray(format="bgr24")
+            faces = fa.get(bgr)
+            if faces:
+                tgt = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+                bgr = swapper.get(bgr, tgt, src_face, paste_back=True)
+                swapped += 1
+            new = av.VideoFrame.from_ndarray(np.ascontiguousarray(bgr), format="bgr24")
+            for packet in ostream.encode(new):
+                out.mux(packet)
+        for packet in ostream.encode():
+            out.mux(packet)
+    finally:
+        out.close()
+        vin.close()
+    if swapped == 0:
+        return video_bytes, "skipped_no_target_faces"
+    return buf.getvalue(), f"applied_{swapped}f"
+
+
 def _mux_ref_audio(video_bytes: bytes, ref_path, duration_s: float) -> bytes:
     """Copy the reference video's audio track onto the generated clip (packet remux, no
     re-encode). Meme mode generates with LTX audio OFF; the meme's own sound is the product."""
@@ -1318,6 +1393,15 @@ def handler(job):
         with open(out, "rb") as f:
             raw = f.read()
         os.remove(out)
+        face_status = None
+        if (meme_mode and FACE_RESTORE and _FACE.get("swapper") is not None
+                and bool(inp.get("face_restore", True))):
+            try:
+                _t_face = time.time()
+                raw, face_status = _face_restore(raw, img_path)
+                face_status = f"{face_status} ({round(time.time() - _t_face, 1)}s)"
+            except Exception as exc:  # noqa: BLE001 — the un-restored clip still beats a failed job
+                face_status = f"face_restore_failed: {str(exc)[:120]}"
         mux_status = None
         if meme_mode and bool(inp.get("preserve_source_audio", True)):
             try:
@@ -1343,6 +1427,8 @@ def handler(job):
             resp["pose_seconds"] = pose_seconds
             resp["frames"] = settings["frames"]
             resp["retarget"] = retarget_mode
+            if face_status:
+                resp["face_restore"] = face_status
             if mux_status:
                 resp["audio"] = mux_status
         if enhanced_prompt is not None:
