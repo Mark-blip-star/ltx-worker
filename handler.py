@@ -908,6 +908,32 @@ def _pose_control_video(src_path, width: int, height: int, n_frames: int, fps: f
     if not frames:
         raise ValueError("reference video decoded to zero frames")
 
+    def _dominant_skeleton(pil_img):
+        """Run DWPose and keep ONLY the most prominent person. Meme references often have
+        bystanders/audiences behind the dancer; rendering every skeleton materialises them
+        in the output (seen on prod posts 27279/27280). Dominance = bbox area x confidence
+        of body keypoints."""
+        import numpy as _np
+        est = det.pose_estimation
+        candidates, scores = est(_np.array(pil_img))
+        if candidates.shape[0] > 1:
+            best, best_val = 0, -1.0
+            for i in range(candidates.shape[0]):
+                body, sc = candidates[i, :18], scores[i, :18]
+                vis = sc > 0.3
+                if vis.sum() < 4:
+                    continue
+                xs, ys = body[vis, 0], body[vis, 1]
+                val = float((xs.max() - xs.min()) * (ys.max() - ys.min()) * sc[vis].mean())
+                if val > best_val:
+                    best, best_val = i, val
+            candidates = candidates[best:best + 1].copy()
+            scores = scores[best:best + 1].copy()
+        h_img, w_img = _np.array(pil_img).shape[:2]
+        pose = det._format_pose(candidates.copy(), scores.copy(), w_img, h_img)
+        from dwpose_vendor.draw import draw_openpose
+        return draw_openpose(pose, height=h_img, width=w_img, include_hands=True, include_face=True)
+
     fh, fw = frames[0].shape[:2]
     target_ar = width / height
     if fw / fh > target_ar:
@@ -925,7 +951,7 @@ def _pose_control_video(src_path, width: int, height: int, n_frames: int, fps: f
         idx = min(int(round(i / fps * src_fps)), len(frames) - 1)
         fr = cv2.resize(frames[idx][ys, xs], (width, height), interpolation=cv2.INTER_AREA)
         pil = Image.fromarray(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB))
-        skel = det(pil, output_type="np", include_hands=True, include_face=True)
+        skel = _dominant_skeleton(pil)
         sk = cv2.cvtColor(np.asarray(skel), cv2.COLOR_RGB2BGR)
         if sk.shape[:2] != (height, width):
             sk = cv2.resize(sk, (width, height))
@@ -1100,6 +1126,18 @@ def handler(job):
             settings["cas_mix"] = float(inp["cas_mix"])
         pose_seconds = None
         if meme_mode:
+            # v8.21: output orientation must follow the REFERENCE video (the pose canvas), not
+            # the character photo. A landscape photo + portrait meme made the backend pick
+            # 1152x640, the portrait skeleton got its head/legs center-cropped away and the
+            # generation invented a giant torso (prod post 27278). Swap dims to match the ref.
+            import cv2 as _cv2
+            _rc = _cv2.VideoCapture(str(ref_src))
+            _rw = _rc.get(_cv2.CAP_PROP_FRAME_WIDTH) or 0
+            _rh = _rc.get(_cv2.CAP_PROP_FRAME_HEIGHT) or 0
+            _rc.release()
+            if _rw and _rh and ((_rh > _rw) != (settings["height"] > settings["width"])):
+                settings["width"], settings["height"] = settings["height"], settings["width"]
+                _INIT_LOG.append(f"meme dims swapped to follow reference orientation ({int(_rw)}x{int(_rh)})")
             # The reference is VAE-encoded at stage1//downscale resolution => full-res dims must
             # be divisible by 128 (empirically: 576x1024 fails inside the VAE, 640x1152 works).
             if settings["width"] % 128 or settings["height"] % 128:
