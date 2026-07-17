@@ -950,8 +950,14 @@ def _mux_ref_audio(video_bytes: bytes, ref_path, duration_s: float) -> bytes:
     buf = io.BytesIO()
     out = av.open(buf, "w", format="mp4")
     try:
-        ov = out.add_stream(template=vin.streams.video[0])
-        oa = out.add_stream(template=ain.streams.audio[0])
+        # av >= 12 renamed template-based stream copy; add_stream(template=) raises
+        # "takes at least 1 positional argument" on the version the image ships.
+        if hasattr(out, "add_stream_from_template"):
+            ov = out.add_stream_from_template(vin.streams.video[0])
+            oa = out.add_stream_from_template(ain.streams.audio[0])
+        else:
+            ov = out.add_stream(template=vin.streams.video[0])
+            oa = out.add_stream(template=ain.streams.audio[0])
         for p in vin.demux(vin.streams.video[0]):
             if p.dts is None:
                 continue
@@ -1095,6 +1101,10 @@ def handler(job):
             if "frames" not in inp:  # follow the meme's own length up to the cap
                 settings["frames"] = _meme_frames(ref_src, settings["fps"])
             audio_on = False  # LTX audio off; the meme's own soundtrack is muxed back post-encode
+            # Identity anchor: the character image must survive 5-10s of pose-driven motion.
+            # Measured on pair A seed 42: 0.8 (i2v default) lost the sunglasses, 0.95 kept them.
+            if "conditioning_strength" not in inp:
+                settings["conditioning_strength"] = 0.95
             _t_pose = time.time()
             pose_path = _pose_control_video(ref_src, settings["width"], settings["height"],
                                             settings["frames"], settings["fps"])
