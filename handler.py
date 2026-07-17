@@ -735,7 +735,10 @@ def _init():
                 pose_onnx = hf_hub_download(DWPOSE_REPO, "dw-ll_ucoco_384.onnx")
                 from dwpose_vendor import DWposeDetector
                 _DWPOSE["det"] = DWposeDetector(model_det=det_onnx, model_pose=pose_onnx, device="cuda")
-                _INIT_LOG.append("dwpose ready (meme mode)")
+                # v8.23.1: ORT falls back to CPU silently when cuDNN is missing — surface which
+                # provider actually won so a slow pose pass is diagnosable from the job response.
+                _DWPOSE["provider"] = _DWPOSE["det"].pose_estimation.session_det.get_providers()[0]
+                _INIT_LOG.append(f"dwpose ready (meme mode, {_DWPOSE['provider']})")
                 if FACE_RESTORE:  # v8.23: source-face swap-back pass (see FACE_RESTORE note)
                     import huggingface_hub.constants as _hfc23
                     _prev23 = _hfc23.HF_HUB_OFFLINE
@@ -751,7 +754,8 @@ def _init():
                     fa.prepare(ctx_id=0, det_size=(640, 640))
                     _FACE["app"] = fa
                     _FACE["swapper"] = get_model(swap_onnx, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-                    _INIT_LOG.append("face-restore ready (buffalo_l + inswapper)")
+                    _FACE["provider"] = next(iter(fa.models.values())).session.get_providers()[0]
+                    _INIT_LOG.append(f"face-restore ready (buffalo_l + inswapper, {_FACE['provider']})")
 
             def _build_pipe():
                 _mark("pipeline_build_start")
@@ -1427,6 +1431,7 @@ def handler(job):
             resp["pose_seconds"] = pose_seconds
             resp["frames"] = settings["frames"]
             resp["retarget"] = retarget_mode
+            resp["onnx_provider"] = {"pose": _DWPOSE.get("provider"), "face": _FACE.get("provider")}
             if face_status:
                 resp["face_restore"] = face_status
             if mux_status:

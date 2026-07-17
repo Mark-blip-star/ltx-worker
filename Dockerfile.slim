@@ -23,6 +23,10 @@ RUN cd /app/LTX-2 && uv python install 3.12 && \
     uv sync --frozen --extra fp8-trtllm --python 3.12 && \
     uv cache clean
 ENV VENV=/app/LTX-2/.venv PATH="/app/LTX-2/.venv/bin:${PATH}"
+# v8.23.1: this -runtime base has NO cuDNN, so onnxruntime's CUDA EP silently fell back to CPU
+# (DWPose 16-21s + face-restore ~65s per 5s clip, both ~5-10x slower than GPU). torch's pip dep
+# nvidia-cudnn-cu12 already ships libcudnn.so.9 inside the venv — just expose it to the loader.
+ENV LD_LIBRARY_PATH="/app/LTX-2/.venv/lib/python3.12/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
 
 # FA3 prebuilt wheel (sm_90a, torch 2.7.1+cu126), --no-deps, KEEP ORIGINAL FILENAME
 RUN curl -fSL -o /tmp/flash_attn_3-3.0.0-cp310-abi3-linux_x86_64.whl \
@@ -51,7 +55,7 @@ COPY warmup.jpg /app/warmup.jpg
 COPY dwpose_vendor /app/dwpose_vendor
 
 # Import smoke-test (CPU-only; catches missing .so + that handler's run_case path imports cleanly)
-RUN cd /app && /app/LTX-2/.venv/bin/python -c "import torch, numpy, PIL, av, OpenImageIO; import ltx_core.loader; import ltx_pipelines.ti2vid_two_stages, ltx_pipelines.iclora_utils; import stage_timing_runner; import dwpose_vendor; from insightface.app import FaceAnalysis; print('IMPORT SMOKE OK', torch.__version__)"
+RUN cd /app && /app/LTX-2/.venv/bin/python -c "import torch, numpy, PIL, av, OpenImageIO; import ltx_core.loader; import ltx_pipelines.ti2vid_two_stages, ltx_pipelines.iclora_utils; import stage_timing_runner; import dwpose_vendor; from insightface.app import FaceAnalysis; import ctypes; ctypes.CDLL('libcudnn.so.9'); print('IMPORT SMOKE OK', torch.__version__)"
 
 # I-3: precompile bytecode so cold boots skip py-compile + stat/hash checks
 RUN /app/LTX-2/.venv/bin/python -m compileall -j 0 -q --invalidation-mode unchecked-hash \
