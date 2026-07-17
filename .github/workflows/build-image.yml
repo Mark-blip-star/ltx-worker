@@ -1,0 +1,56 @@
+name: build-worker-image
+
+# Headless image build: no DO droplet, no local 1Password, no laptop. Trigger:
+#   gh workflow run build-image.yml -f new_tag=v8.21 -f prev_tag=v8.20
+# or POST /actions/workflows/build-image.yml/dispatches with the same inputs.
+on:
+  workflow_dispatch:
+    inputs:
+      new_tag:
+        description: "Tag to build and push (e.g. v8.20)"
+        required: true
+      prev_tag:
+        description: "Previous tag for registry layer cache"
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # The image is ~12GB; the stock runner disk is tight. Standard cleanup buys ~25GB.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.slim
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ghcr.io/mark-blip-star/ltx-worker-slim:${{ inputs.new_tag }}
+          cache-from: type=registry,ref=ghcr.io/mark-blip-star/ltx-worker-slim:${{ inputs.prev_tag }}
+          cache-to: type=inline
+
+      - name: Verify pushed manifest
+        run: |
+          docker buildx imagetools inspect ghcr.io/mark-blip-star/ltx-worker-slim:${{ inputs.new_tag }} | head -5
+          echo "PUSH_VERIFIED"
