@@ -1030,7 +1030,7 @@ def handler(job):
         # v8.20: reference_video_b64 present => MEME MODE (motion control): i2v first-frame
         # conditioning from image_b64 + DWPose skeleton of the reference video through the
         # Union IC-LoRA. Requires an endpoint provisioned with LTX_MEME=1 + the fused IC-LoRA.
-        meme_mode = bool(inp.get("reference_video_b64"))
+        meme_mode = bool(inp.get("reference_video_b64") or inp.get("reference_video_url"))
         ref_src = None
         if meme_mode:
             if not (MEME_MODE and _DWPOSE.get("det") is not None):
@@ -1042,9 +1042,16 @@ def handler(job):
             if not inp.get("image_b64"):
                 return {"error": "meme mode requires image_b64 (the character image)",
                         "config_tag": f"{CONFIG_TAG}-{tier}"}
+            # v8.20.4: reference by URL is the product path — RunPod /run caps payloads at 10MB
+            # and a 10s meme reference + character image in base64 blows past it (pair B did).
             ref_src = _IN / "ref_src.mp4"
-            with open(ref_src, "wb") as f:
-                f.write(base64.b64decode(inp["reference_video_b64"]))
+            if inp.get("reference_video_b64"):
+                with open(ref_src, "wb") as f:
+                    f.write(base64.b64decode(inp["reference_video_b64"]))
+            else:
+                import urllib.request as _rq
+                with _rq.urlopen(inp["reference_video_url"], timeout=60) as r, open(ref_src, "wb") as f:
+                    f.write(r.read())
 
         # v8.17: image_b64 OPTIONAL. Absent => TEXT-TO-VIDEO (no conditioning image); present => i2v.
         # Same LTX-2.3 model handles both; t2v just passes empty image-conditionings (combined_image_
