@@ -1132,6 +1132,22 @@ def handler(job):
             if not inp.get("image_b64"):
                 return {"error": "meme mode requires image_b64 (the character image)",
                         "config_tag": f"{CONFIG_TAG}-{tier}"}
+            # v8.22.1: bake EXIF orientation into the character pixels. The backend does this
+            # via sharp already, but a raw phone photo sent straight to the API arrives rotated
+            # for cv2/the conditioning reader (both ignore EXIF) and the clip comes out sideways.
+            try:
+                import io as _io
+
+                from PIL import Image as _PILImage
+                from PIL import ImageOps as _PILImageOps
+
+                _img = _PILImage.open(_io.BytesIO(base64.b64decode(inp["image_b64"])))
+                _img = _PILImageOps.exif_transpose(_img).convert("RGB")
+                _buf = _io.BytesIO()
+                _img.save(_buf, format="PNG")
+                inp["image_b64"] = base64.b64encode(_buf.getvalue()).decode()
+            except Exception as exc:  # noqa: BLE001 — a bad EXIF tag must not kill the job
+                _INIT_LOG.append(f"exif transpose skipped: {exc!r}")
             # v8.20.4: reference by URL is the product path — RunPod /run caps payloads at 10MB
             # and a 10s meme reference + character image in base64 blows past it (pair B did).
             ref_src = _IN / "ref_src.mp4"
