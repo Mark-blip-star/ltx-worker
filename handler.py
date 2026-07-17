@@ -463,15 +463,20 @@ def _resolve_repo() -> str:
         return p
     except Exception as exc:
         _INIT_LOG.append(f"not cached ({exc!r}); downloading from HF...")
-        # v8.20.1: hosts WITHOUT console-pinned Cached Models hit this fallback, but the global
-        # HF_HUB_OFFLINE (set for the staged-weights fast path) blocked the download itself —
-        # INIT_FAILED on any fresh endpoint. Scrub for the fetch (same trick as v8.16/log_uploader),
-        # then restore so the rest of init keeps the offline fast path.
-        prev_offline = {k: os.environ.pop(k, None) for k in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")}
+        # v8.20.2: hosts WITHOUT console-pinned Cached Models hit this fallback, but hub freezes
+        # HF_HUB_OFFLINE into `constants` AT IMPORT TIME — popping the env var at call time does
+        # nothing (v8.20.1 mistake; log_uploader dodges it by scrubbing before import in a fresh
+        # process). Flip the constant itself for the fetch, then restore the offline fast path.
+        import huggingface_hub.constants as _hfc
+
+        prev_flag = _hfc.HF_HUB_OFFLINE
+        prev_env = {k: os.environ.pop(k, None) for k in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")}
+        _hfc.HF_HUB_OFFLINE = False
         try:
             return snapshot_download(WEIGHTS_REPO, token=os.environ.get("HF_TOKEN"))
         finally:
-            for k, v in prev_offline.items():
+            _hfc.HF_HUB_OFFLINE = prev_flag
+            for k, v in prev_env.items():
                 if v is not None:
                     os.environ[k] = v
 
