@@ -188,6 +188,9 @@ _REF_DOWNSCALE = {"factor": 1}  # read from the extra LoRA's safetensors metadat
 # junk draws (2-6). Each retry costs ~8s of upsampler on an otherwise ~25-45s job.
 ENHANCE_T2V_TRIES = int(os.environ.get("LTX_ENHANCE_T2V_TRIES", "2"))
 ENHANCE_T2V_MIN_WORDS = int(os.environ.get("LTX_ENHANCE_T2V_MIN_WORDS", "40"))
+# v8.22: retarget the meme skeleton into the character photo's composition (see
+# _pose_control_video). Per-request "retarget": false for A/B; env kill-switch here.
+MEME_RETARGET = os.environ.get("LTX_MEME_RETARGET", "1") == "1"
 # v8.9 CAS (Contrast-Adaptive Sharpen) — DEFAULT-ON post-decode crispness pass (research 2026-06-17:
 #   dominant artifacts = thin-structure dissolve + sharpness collapse on fast motion). Applied to the
 #   pixel chunks before H264 encode in stage_timing_runner (~+0.6s). Tunable; request {"cas_amount":0}
@@ -885,17 +888,63 @@ def _meme_frames(src_path, fps: float) -> int:
     return (n - 1) // 8 * 8 + 1
 
 
-def _pose_control_video(src_path, width: int, height: int, n_frames: int, fps: float):
-    """Reference video -> DWPose skeleton control video (v8.20 meme mode).
-    Matches the official IC-LoRA ComfyUI preprocessing (DWPreprocessor): openpose-style
-    skeleton with hands+face on black, center-cropped to the output aspect, resampled to
-    exactly n_frames @ fps. Rendered at OUTPUT resolution — the reference-conditioning util
-    downscales to stage1//ref_factor itself."""
+def _pose_control_video(src_path, char_path, width: int, height: int, n_frames: int, fps: float,
+                        retarget: bool = True):
+    """Reference video -> DWPose skeleton control video (v8.20 meme mode; v8.22 retargeting).
+
+    v8.21: only the DOMINANT person is rendered (meme audiences materialised otherwise).
+    v8.22 RETARGETING: the skeleton is scaled+anchored INTO the character photo's composition.
+    Without it, frame-0 conditioning (the photo) and the skeleton (meme's position/scale)
+    contradict each other and the model resolves the conflict with a hard scene cut ~0.5s in,
+    repainting the character and background (prod posts 27278-27280). WAN-Animate ships the
+    same alignment step natively. Affine = uniform scale matching body-bbox heights + feet
+    bottom-center anchor; fallback chain: char skeleton -> yolox person bbox -> no retarget.
+
+    Returns (path, retarget_mode)."""
     import cv2
     import numpy as np
-    from PIL import Image
 
     det = _DWPOSE["det"]
+    est = det.pose_estimation
+
+    def _fit_to_canvas(img):
+        fh, fw = img.shape[:2]
+        target_ar = width / height
+        if fw / fh > target_ar:
+            cw = max(2, int(fh * target_ar))
+            x0 = (fw - cw) // 2
+            img = img[:, x0:x0 + cw]
+        else:
+            ch = max(2, int(fw / target_ar))
+            y0 = (fh - ch) // 2
+            img = img[y0:y0 + ch, :]
+        return cv2.resize(img, (width, height), interpolation=cv2.INTER_AREA)
+
+    def _dominant_raw(rgb):
+        """(candidates[1,134,2], scores[1,134]) of the most prominent person, else None."""
+        candidates, scores = est(rgb)
+        if candidates.shape[0] == 0:
+            return None
+        best, best_val = -1, -1.0
+        for i in range(candidates.shape[0]):
+            body, sc = candidates[i, :18], scores[i, :18]
+            vis = sc > 0.3
+            if vis.sum() < 4:
+                continue
+            bxs, bys = body[vis, 0], body[vis, 1]
+            val = float((bxs.max() - bxs.min()) * (bys.max() - bys.min()) * sc[vis].mean())
+            if val > best_val:
+                best, best_val = i, val
+        if best < 0:
+            return None
+        return candidates[best:best + 1].copy(), scores[best:best + 1].copy()
+
+    def _body_bbox(cand, sc):
+        body, s = cand[0, :18], sc[0, :18]
+        vis = s > 0.3
+        bxs, bys = body[vis, 0], body[vis, 1]
+        return float(bxs.min()), float(bys.min()), float(bxs.max()), float(bys.max())
+
     cap = cv2.VideoCapture(str(src_path))
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     frames = []
@@ -908,56 +957,71 @@ def _pose_control_video(src_path, width: int, height: int, n_frames: int, fps: f
     if not frames:
         raise ValueError("reference video decoded to zero frames")
 
-    def _dominant_skeleton(pil_img):
-        """Run DWPose and keep ONLY the most prominent person. Meme references often have
-        bystanders/audiences behind the dancer; rendering every skeleton materialises them
-        in the output (seen on prod posts 27279/27280). Dominance = bbox area x confidence
-        of body keypoints."""
-        import numpy as _np
-        est = det.pose_estimation
-        candidates, scores = est(_np.array(pil_img))
-        if candidates.shape[0] > 1:
-            best, best_val = 0, -1.0
-            for i in range(candidates.shape[0]):
-                body, sc = candidates[i, :18], scores[i, :18]
-                vis = sc > 0.3
-                if vis.sum() < 4:
-                    continue
-                xs, ys = body[vis, 0], body[vis, 1]
-                val = float((xs.max() - xs.min()) * (ys.max() - ys.min()) * sc[vis].mean())
-                if val > best_val:
-                    best, best_val = i, val
-            candidates = candidates[best:best + 1].copy()
-            scores = scores[best:best + 1].copy()
-        h_img, w_img = _np.array(pil_img).shape[:2]
-        pose = det._format_pose(candidates.copy(), scores.copy(), w_img, h_img)
-        from dwpose_vendor.draw import draw_openpose
-        return draw_openpose(pose, height=h_img, width=w_img, include_hands=True, include_face=True)
+    # Detect once per SOURCE frame (output frames repeat sources when ref fps < target).
+    raw_cache: dict = {}
 
-    fh, fw = frames[0].shape[:2]
-    target_ar = width / height
-    if fw / fh > target_ar:
-        cw = max(2, int(fh * target_ar))
-        x0 = (fw - cw) // 2
-        ys, xs = slice(None), slice(x0, x0 + cw)
-    else:
-        ch = max(2, int(fw / target_ar))
-        y0 = (fh - ch) // 2
-        ys, xs = slice(y0, y0 + ch), slice(None)
+    def _raw_for(idx):
+        if idx not in raw_cache:
+            canvas = _fit_to_canvas(frames[idx])
+            raw_cache[idx] = _dominant_raw(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+        return raw_cache[idx]
+
+    sample_idx = [min(int(round(i / fps * src_fps)), len(frames) - 1) for i in range(n_frames)]
+
+    # --- retarget affine (v8.22) ---
+    s_scale, tx, ty, mode = 1.0, 0.0, 0.0, "off"
+    if retarget:
+        char_bgr = cv2.imread(str(char_path))
+        if char_bgr is not None:
+            char_canvas = _fit_to_canvas(char_bgr)
+            char_rgb = cv2.cvtColor(char_canvas, cv2.COLOR_BGR2RGB)
+            ref_boxes = []
+            for idx in sorted(set(sample_idx[: max(1, len(sample_idx) // 2)])):
+                raw = _raw_for(idx)
+                if raw is not None:
+                    ref_boxes.append(_body_bbox(*raw))
+            if ref_boxes:
+                rx0, ry0, rx1, ry1 = [float(v) for v in np.median(np.array(ref_boxes), axis=0)]
+                anchor = None
+                char_raw = _dominant_raw(char_rgb)
+                if char_raw is not None:
+                    cx0, cy0, cx1, cy1 = _body_bbox(*char_raw)
+                    if (cy1 - cy0) > 8:
+                        anchor, mode = (cx0, cy0, cx1, cy1), "skeleton"
+                if anchor is None:  # cartoons DWPose can miss; yolox person bbox still often fires
+                    from dwpose_vendor.body_estimation.detector import inference_detector
+                    boxes = inference_detector(est.session_det, char_rgb)
+                    if boxes is not None and len(boxes):
+                        b = max(boxes, key=lambda bb: (bb[2] - bb[0]) * (bb[3] - bb[1]))
+                        anchor, mode = (float(b[0]), float(b[1]), float(b[2]), float(b[3])), "bbox"
+                if anchor is not None and (ry1 - ry0) > 8:
+                    cx0, cy0, cx1, cy1 = anchor
+                    s_scale = float(np.clip((cy1 - cy0) / (ry1 - ry0), 0.4, 2.5))
+                    tx = (cx0 + cx1) / 2.0 - s_scale * (rx0 + rx1) / 2.0
+                    ty = cy1 - s_scale * ry1  # feet stay where the character stands
+                else:
+                    mode = "off"
+
+    from dwpose_vendor.draw import draw_openpose
 
     out_path = _IN / "pose_ctrl.mp4"
     vw = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    blank = np.zeros((height, width, 3), dtype=np.uint8)
     for i in range(n_frames):
-        idx = min(int(round(i / fps * src_fps)), len(frames) - 1)
-        fr = cv2.resize(frames[idx][ys, xs], (width, height), interpolation=cv2.INTER_AREA)
-        pil = Image.fromarray(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB))
-        skel = _dominant_skeleton(pil)
-        sk = cv2.cvtColor(np.asarray(skel), cv2.COLOR_RGB2BGR)
-        if sk.shape[:2] != (height, width):
-            sk = cv2.resize(sk, (width, height))
-        vw.write(sk)
+        raw = _raw_for(sample_idx[i])
+        if raw is None:
+            vw.write(blank)
+            continue
+        cand, sc = raw[0].copy(), raw[1].copy()
+        if mode != "off":
+            cand[..., 0] = cand[..., 0] * s_scale + tx
+            cand[..., 1] = cand[..., 1] * s_scale + ty
+        pose = det._format_pose(cand, sc, width, height)
+        frame_rgb = draw_openpose(pose, height=height, width=width,
+                                  include_hands=True, include_face=True)
+        vw.write(cv2.cvtColor(np.asarray(frame_rgb), cv2.COLOR_RGB2BGR))
     vw.release()
-    return out_path
+    return out_path, mode
 
 
 def _mux_ref_audio(video_bytes: bytes, ref_path, duration_s: float) -> bytes:
@@ -1151,8 +1215,11 @@ def handler(job):
             if "conditioning_strength" not in inp:
                 settings["conditioning_strength"] = 0.95
             _t_pose = time.time()
-            pose_path = _pose_control_video(ref_src, settings["width"], settings["height"],
-                                            settings["frames"], settings["fps"])
+            pose_path, retarget_mode = _pose_control_video(
+                ref_src, img_path, settings["width"], settings["height"],
+                settings["frames"], settings["fps"],
+                retarget=bool(inp.get("retarget", MEME_RETARGET)),
+            )
             pose_seconds = round(time.time() - _t_pose, 2)
             settings["video_conditioning"] = [(str(pose_path), float(inp.get("reference_strength", 0.9)))]
             settings["reference_downscale"] = _REF_DOWNSCALE["factor"]
@@ -1259,6 +1326,7 @@ def handler(job):
         if meme_mode:
             resp["pose_seconds"] = pose_seconds
             resp["frames"] = settings["frames"]
+            resp["retarget"] = retarget_mode
             if mux_status:
                 resp["audio"] = mux_status
         if enhanced_prompt is not None:
