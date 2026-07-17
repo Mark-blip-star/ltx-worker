@@ -1361,17 +1361,43 @@ def run_case(
         fps=settings["fps"],
     )
 
-    with timed(timers, "stage1_image_conditioner"):
-        stage_1_conditionings = pipeline.image_conditioner(
-            lambda enc: combined_image_conditionings(
-                images=_imgs,
+    # v8.20 meme mode: IC-LoRA reference conditioning (pose/depth/canny control video) rides
+    # stage 1 ONLY — stock ICLoraPipeline does the same (stage 2 gets image conditionings only).
+    # settings["video_conditioning"] = [(path, strength)]; the reference is VAE-encoded at
+    # stage1//downscale resolution by the util itself, using the SAME resident encoder.
+    video_conditioning = settings.get("video_conditioning") or []
+    reference_downscale = int(settings.get("reference_downscale", 1))
+
+    def _stage_1_conditionings(enc):
+        conds = combined_image_conditionings(
+            images=_imgs,
+            height=stage_1_output_shape.height,
+            width=stage_1_output_shape.width,
+            video_encoder=enc,
+            dtype=dtype,
+            device=pipeline.device,
+        )
+        if video_conditioning:
+            from ltx_pipelines.iclora_utils import append_ic_lora_reference_video_conditionings
+
+            append_ic_lora_reference_video_conditionings(
+                conds,
+                [(str(p), float(s)) for p, s in video_conditioning],
                 height=stage_1_output_shape.height,
                 width=stage_1_output_shape.width,
+                num_frames=settings["frames"],
                 video_encoder=enc,
                 dtype=dtype,
                 device=pipeline.device,
+                reference_downscale_factor=reference_downscale,
+                conditioning_attention_strength=float(settings.get("reference_attention", 1.0)),
+                conditioning_attention_mask=None,
+                tiling_config=None,
             )
-        )
+        return conds
+
+    with timed(timers, "stage1_image_conditioner"):
+        stage_1_conditionings = pipeline.image_conditioner(_stage_1_conditionings)
     record["vram_after"]["stage1_image_conditioner"] = peak_vram_gib()
 
     sigmas = LTX2Scheduler().execute(steps=settings["dev_inference_steps"]).to(

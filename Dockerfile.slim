@@ -30,15 +30,20 @@ RUN curl -fSL -o /tmp/flash_attn_3-3.0.0-cp310-abi3-linux_x86_64.whl \
     uv pip install --python "$VENV/bin/python" --no-deps /tmp/flash_attn_3-3.0.0-cp310-abi3-linux_x86_64.whl && \
     uv pip install --python "$VENV/bin/python" runpod bitsandbytes && rm -f /tmp/*.whl && uv cache clean
 
+# v8.20 meme mode deps: DWPose preprocessor (onnx) + frame IO. Idle on non-meme endpoints
+# (imported only when LTX_MEME=1), so the regular video endpoint stays bit-exact.
+RUN uv pip install --python "$VENV/bin/python" onnxruntime-gpu opencv-python-headless && uv cache clean
+
 # --- app code (hot layer: changes here don't rebuild venv) ---
 COPY stage_timing_runner.py /app/stage_timing_runner.py
 COPY handler.py /app/handler.py
 COPY log_uploader.py /app/log_uploader.py
 COPY start.sh /app/start.sh
 COPY warmup.jpg /app/warmup.jpg
+COPY dwpose_vendor /app/dwpose_vendor
 
 # Import smoke-test (CPU-only; catches missing .so + that handler's run_case path imports cleanly)
-RUN cd /app && /app/LTX-2/.venv/bin/python -c "import torch, numpy, PIL, av, OpenImageIO; import ltx_core.loader; import ltx_pipelines.ti2vid_two_stages; import stage_timing_runner; print('IMPORT SMOKE OK', torch.__version__)"
+RUN cd /app && /app/LTX-2/.venv/bin/python -c "import torch, numpy, PIL, av, OpenImageIO; import ltx_core.loader; import ltx_pipelines.ti2vid_two_stages, ltx_pipelines.iclora_utils; import stage_timing_runner; import dwpose_vendor; print('IMPORT SMOKE OK', torch.__version__)"
 
 # I-3: precompile bytecode so cold boots skip py-compile + stat/hash checks
 RUN /app/LTX-2/.venv/bin/python -m compileall -j 0 -q --invalidation-mode unchecked-hash \

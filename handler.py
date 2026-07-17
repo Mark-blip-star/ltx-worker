@@ -1,4 +1,12 @@
-"""LTX-2.3 RunPod serverless handler v8.19 — v8.17 + t2v prompt enhancement (text-only Gemma rewrite).
+"""LTX-2.3 RunPod serverless handler v8.20 — v8.19 + meme motion-control mode (Union IC-LoRA).
+
+v8.20 (2026-07-17):
+- MEME MODE (env LTX_MEME=1): request {image_b64, reference_video_b64} => DWPose skeleton of the
+  reference video rides the Union IC-LoRA as reference conditioning; first frame = the character
+  image; LTX audio off, the meme's own soundtrack is remuxed onto the output. The Union LoRA is
+  fused via the existing LTX_EXTRA_LORA_* lever (its reference_downscale_factor is read from the
+  safetensors metadata). Dims must be divisible by 128; frames follow the meme (cap 241 @24fps).
+  Non-meme endpoints (LTX_MEME unset) are bit-exact: no dwpose import, no new request fields.
 
 v8.19 (2026-07-16):
 - Terminate the phrase handed to the upsampler. Upstream's enhance_t2v frames the user turn as
@@ -165,6 +173,16 @@ ENHANCE_MAX_TOKENS = int(os.environ.get("LTX_ENHANCE_MAX_TOKENS", "400"))
 # disables ONLY the t2v rewrite (env-level rollback without an image rollback).
 ENHANCE_T2V = os.environ.get("LTX_ENHANCE_T2V", "1") == "1"
 ENHANCE_T2V_SYS = os.environ.get("LTX_ENHANCE_T2V_SYSTEM_PROMPT") or None
+# v8.20 MEME MODE (motion control): request carries reference_video_b64 + image_b64; the worker
+# extracts a DWPose skeleton video and rides it through the Union IC-LoRA reference conditioning.
+# OFF by default => the regular video endpoint stays bit-exact and never loads dwpose/onnxruntime.
+# The Union LoRA itself is fused via the existing LTX_EXTRA_LORA_* lever (same proven fuse path);
+# a meme endpoint = same image, env: LTX_MEME=1 + LTX_EXTRA_LORA_REPO/FILE/S1/S2.
+MEME_MODE = os.environ.get("LTX_MEME", "0") == "1"
+MEME_MAX_FRAMES = int(os.environ.get("LTX_MEME_MAX_FRAMES", "241"))  # 10s @ 24fps, 8k+1
+DWPOSE_REPO = os.environ.get("LTX_DWPOSE_REPO", "RedHash/DWPose")
+_DWPOSE = {"det": None}       # built at init when LTX_MEME=1 (single-threaded handler)
+_REF_DOWNSCALE = {"factor": 1}  # read from the extra LoRA's safetensors metadata at init
 # Degenerate-rewrite guard (see _enhance_prompt_t2v): re-roll a too-short rewrite, then give up
 # and use the raw prompt. 40 words is well under a real rewrite (~125-210) and well over the
 # junk draws (2-6). Each retry costs ~8s of upsampler on an otherwise ~25-45s job.
@@ -679,6 +697,19 @@ def _init():
                 os.environ.pop("HF_HUB_OFFLINE", None); os.environ.pop("TRANSFORMERS_OFFLINE", None)
                 extra_lora_path = hf_hub_download(EXTRA_LORA_REPO, EXTRA_LORA_FILE)
                 _INIT_LOG.append(f"extra LoRA {EXTRA_LORA_REPO}/{EXTRA_LORA_FILE} s1={EXTRA_LORA_S1} s2={EXTRA_LORA_S2}")
+                # v8.20: IC-LoRAs carry their reference downscale in safetensors metadata (ref0.5 => 2).
+                from ltx_pipelines.iclora_utils import read_lora_reference_downscale_factor
+                _REF_DOWNSCALE["factor"] = read_lora_reference_downscale_factor(extra_lora_path)
+                _INIT_LOG.append(f"reference_downscale_factor={_REF_DOWNSCALE['factor']}")
+
+            if MEME_MODE:  # v8.20: DWPose onnx pair for the meme motion-control preprocessor
+                from huggingface_hub import hf_hub_download
+                os.environ.pop("HF_HUB_OFFLINE", None); os.environ.pop("TRANSFORMERS_OFFLINE", None)
+                det_onnx = hf_hub_download(DWPOSE_REPO, "yolox_l.onnx")
+                pose_onnx = hf_hub_download(DWPOSE_REPO, "dw-ll_ucoco_384.onnx")
+                from dwpose_vendor import DWposeDetector
+                _DWPOSE["det"] = DWposeDetector(model_det=det_onnx, model_pose=pose_onnx, device="cuda")
+                _INIT_LOG.append("dwpose ready (meme mode)")
 
             def _build_pipe():
                 _mark("pipeline_build_start")
@@ -826,6 +857,105 @@ def _enhance_prompt_t2v(prompt: str, seed: int, max_new_tokens=None, system_prom
     return prompt  # raw prompt beats a fragment that would replace it
 
 
+def _meme_frames(src_path, fps: float) -> int:
+    """Frame budget from the reference video: min(ref duration, cap) @ fps, snapped to 8k+1."""
+    import cv2
+    cap = cv2.VideoCapture(str(src_path))
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    cap.release()
+    duration = (count / src_fps) if count > 0 else 5.0
+    n = int(duration * fps)
+    n = max(49, min(n, MEME_MAX_FRAMES))
+    return (n - 1) // 8 * 8 + 1
+
+
+def _pose_control_video(src_path, width: int, height: int, n_frames: int, fps: float):
+    """Reference video -> DWPose skeleton control video (v8.20 meme mode).
+    Matches the official IC-LoRA ComfyUI preprocessing (DWPreprocessor): openpose-style
+    skeleton with hands+face on black, center-cropped to the output aspect, resampled to
+    exactly n_frames @ fps. Rendered at OUTPUT resolution — the reference-conditioning util
+    downscales to stage1//ref_factor itself."""
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    det = _DWPOSE["det"]
+    cap = cv2.VideoCapture(str(src_path))
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frames = []
+    while True:
+        ok, fr = cap.read()
+        if not ok:
+            break
+        frames.append(fr)
+    cap.release()
+    if not frames:
+        raise ValueError("reference video decoded to zero frames")
+
+    fh, fw = frames[0].shape[:2]
+    target_ar = width / height
+    if fw / fh > target_ar:
+        cw = max(2, int(fh * target_ar))
+        x0 = (fw - cw) // 2
+        ys, xs = slice(None), slice(x0, x0 + cw)
+    else:
+        ch = max(2, int(fw / target_ar))
+        y0 = (fh - ch) // 2
+        ys, xs = slice(y0, y0 + ch), slice(None)
+
+    out_path = _IN / "pose_ctrl.mp4"
+    vw = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    for i in range(n_frames):
+        idx = min(int(round(i / fps * src_fps)), len(frames) - 1)
+        fr = cv2.resize(frames[idx][ys, xs], (width, height), interpolation=cv2.INTER_AREA)
+        pil = Image.fromarray(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB))
+        skel = det(pil, output_type="np", include_hands=True, include_face=True)
+        sk = cv2.cvtColor(np.asarray(skel), cv2.COLOR_RGB2BGR)
+        if sk.shape[:2] != (height, width):
+            sk = cv2.resize(sk, (width, height))
+        vw.write(sk)
+    vw.release()
+    return out_path
+
+
+def _mux_ref_audio(video_bytes: bytes, ref_path, duration_s: float) -> bytes:
+    """Copy the reference video's audio track onto the generated clip (packet remux, no
+    re-encode). Meme mode generates with LTX audio OFF; the meme's own sound is the product."""
+    import io
+
+    import av
+
+    with av.open(str(ref_path)) as probe:
+        if not probe.streams.audio:
+            return video_bytes
+
+    vin = av.open(io.BytesIO(video_bytes))
+    ain = av.open(str(ref_path))
+    buf = io.BytesIO()
+    out = av.open(buf, "w", format="mp4")
+    try:
+        ov = out.add_stream(template=vin.streams.video[0])
+        oa = out.add_stream(template=ain.streams.audio[0])
+        for p in vin.demux(vin.streams.video[0]):
+            if p.dts is None:
+                continue
+            p.stream = ov
+            out.mux(p)
+        for p in ain.demux(ain.streams.audio[0]):
+            if p.dts is None:
+                continue
+            if p.pts is not None and float(p.pts * p.time_base) > duration_s:
+                break
+            p.stream = oa
+            out.mux(p)
+    finally:
+        out.close()
+        vin.close()
+        ain.close()
+    return buf.getvalue()
+
+
 def handler(job):
     global _FIRST_JOB_SEEN
     if not _FIRST_JOB_SEEN:
@@ -876,6 +1006,25 @@ def handler(job):
             sig[-1] = 0.0
             steps = len(sig) - 1
 
+        # v8.20: reference_video_b64 present => MEME MODE (motion control): i2v first-frame
+        # conditioning from image_b64 + DWPose skeleton of the reference video through the
+        # Union IC-LoRA. Requires an endpoint provisioned with LTX_MEME=1 + the fused IC-LoRA.
+        meme_mode = bool(inp.get("reference_video_b64"))
+        ref_src = None
+        if meme_mode:
+            if not (MEME_MODE and _DWPOSE.get("det") is not None):
+                return {"error": "meme mode not enabled on this endpoint (needs LTX_MEME=1 + LTX_EXTRA_LORA_* union IC-LoRA)",
+                        "config_tag": f"{CONFIG_TAG}-{tier}"}
+            if _REF_DOWNSCALE["factor"] == 1 or not EXTRA_LORA_REPO:
+                return {"error": "meme mode endpoint misconfigured: union IC-LoRA not fused (LTX_EXTRA_LORA_* unset)",
+                        "config_tag": f"{CONFIG_TAG}-{tier}"}
+            if not inp.get("image_b64"):
+                return {"error": "meme mode requires image_b64 (the character image)",
+                        "config_tag": f"{CONFIG_TAG}-{tier}"}
+            ref_src = _IN / "ref_src.mp4"
+            with open(ref_src, "wb") as f:
+                f.write(base64.b64decode(inp["reference_video_b64"]))
+
         # v8.17: image_b64 OPTIONAL. Absent => TEXT-TO-VIDEO (no conditioning image); present => i2v.
         # Same LTX-2.3 model handles both; t2v just passes empty image-conditionings (combined_image_
         # conditionings(images=[]) -> no conditioning) and skips the vision-enhancer (which needs an image).
@@ -921,6 +1070,25 @@ def handler(job):
             settings["cas_amount"] = float(inp["cas_amount"])
         if "cas_mix" in inp:
             settings["cas_mix"] = float(inp["cas_mix"])
+        pose_seconds = None
+        if meme_mode:
+            # The reference is VAE-encoded at stage1//downscale resolution => full-res dims must
+            # be divisible by 128 (empirically: 576x1024 fails inside the VAE, 640x1152 works).
+            if settings["width"] % 128 or settings["height"] % 128:
+                return {"error": "meme mode needs width/height divisible by 128 (reference VAE grid)",
+                        "config_tag": f"{CONFIG_TAG}-{tier}"}
+            if "frames" not in inp:  # follow the meme's own length up to the cap
+                settings["frames"] = _meme_frames(ref_src, settings["fps"])
+            audio_on = False  # LTX audio off; the meme's own soundtrack is muxed back post-encode
+            _t_pose = time.time()
+            pose_path = _pose_control_video(ref_src, settings["width"], settings["height"],
+                                            settings["frames"], settings["fps"])
+            pose_seconds = round(time.time() - _t_pose, 2)
+            settings["video_conditioning"] = [(str(pose_path), float(inp.get("reference_strength", 0.9)))]
+            settings["reference_downscale"] = _REF_DOWNSCALE["factor"]
+            if "reference_attention" in inp:
+                settings["reference_attention"] = float(inp["reference_attention"])
+
         # L-5 gate: resident floor ~71-73 GiB; larger jobs would OOM even uncached
         # (floor stays + their own 22.6 GiB fuse transient + ~2.3x activations).
         if settings["width"] * settings["height"] > _MAX_PIXELS or settings["frames"] > _MAX_FRAMES:
@@ -997,11 +1165,19 @@ def handler(job):
         with open(out, "rb") as f:
             raw = f.read()
         os.remove(out)
+        mux_status = None
+        if meme_mode and bool(inp.get("preserve_source_audio", True)):
+            try:
+                raw = _mux_ref_audio(raw, ref_src, settings["frames"] / settings["fps"])
+                mux_status = "source_audio_muxed"
+            except Exception as exc:  # noqa: BLE001 — video without audio beats a failed job
+                mux_status = f"mux_failed: {str(exc)[:120]}"
         resp = {
             "peak_vram_gib": rec.get("peak_vram_gib"),
             "elapsed_seconds": rec.get("elapsed_seconds"),
             "timers": rec.get("timers"),
-            "config_tag": (f"{CONFIG_TAG}-{tier}" + ("" if audio_on else "-noaudio")
+            "config_tag": (f"{CONFIG_TAG}-{tier}" + ("-meme" if meme_mode else "")
+                           + ("" if audio_on else "-noaudio")
                            + (f"-sig{steps}" if sig else "") + ("-enh" if enhanced_prompt else "")
                            + ("-ge" if ge_on else "") + (f"-s2_{len(_stage2)}" if "stage2_sigmas" in inp else "")
                            + (f"-dn{inp['decode_noise']}" if "decode_noise" in inp else "")
@@ -1010,6 +1186,11 @@ def handler(job):
                            + (f"-dd{inp['detail_daemon']}" if "detail_daemon" in inp else "")),
             "tier": tier,
         }
+        if meme_mode:
+            resp["pose_seconds"] = pose_seconds
+            resp["frames"] = settings["frames"]
+            if mux_status:
+                resp["audio"] = mux_status
         if enhanced_prompt is not None:
             resp["raw_prompt"] = raw_prompt
             resp["enhanced_prompt"] = enhanced_prompt
