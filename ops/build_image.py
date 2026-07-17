@@ -122,15 +122,16 @@ try:
     print("ghcr login ok", flush=True)
 
     build_cmd = (
-        "cd /build/gh && docker buildx build -f Dockerfile.slim --platform linux/amd64 "
+        "set -o pipefail; cd /build/gh && docker buildx build -f Dockerfile.slim --platform linux/amd64 "
         f"--provenance=false --cache-from type=registry,ref={IMAGE}:{PREV_TAG} "
-        f"--cache-to type=inline -t {IMAGE}:{NEW_TAG} --push . 2>&1 | tail -25"
+        f"--cache-to type=inline -t {IMAGE}:{NEW_TAG} --push . 2>&1 | tail -40 "
+        "&& echo PUSH_MARKER_OK"
     )
     r = ssh(ip, build_cmd, timeout=3600)
     print("=== build tail ===", flush=True)
     print(r.stdout[-3000:], flush=True)
-    if r.returncode != 0:
-        sys.exit(f"BUILD FAILED (exit {r.returncode})")
+    if r.returncode != 0 or "PUSH_MARKER_OK" not in r.stdout:
+        sys.exit(f"BUILD FAILED (exit {r.returncode}, marker={'PUSH_MARKER_OK' in r.stdout})")
 
     r = ssh(ip, f"docker buildx imagetools inspect {IMAGE}:{NEW_TAG} | head -5")
     print("=== pushed image ===", flush=True)

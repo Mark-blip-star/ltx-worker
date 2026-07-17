@@ -32,7 +32,9 @@ RUN curl -fSL -o /tmp/flash_attn_3-3.0.0-cp310-abi3-linux_x86_64.whl \
 
 # v8.20 meme mode deps: DWPose preprocessor (onnx) + frame IO. Idle on non-meme endpoints
 # (imported only when LTX_MEME=1), so the regular video endpoint stays bit-exact.
-RUN uv pip install --python "$VENV/bin/python" onnxruntime-gpu opencv-python-headless && uv cache clean
+# onnxruntime-gpu pinned to the last CUDA-12 line: 1.21+ links libcudart.so.13 (CUDA 13)
+# and dies on import inside this cu12.6 image (caught by the smoke test below).
+RUN uv pip install --python "$VENV/bin/python" "onnxruntime-gpu==1.20.1" opencv-python-headless && uv cache clean
 
 # --- app code (hot layer: changes here don't rebuild venv) ---
 COPY stage_timing_runner.py /app/stage_timing_runner.py
