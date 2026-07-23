@@ -84,6 +84,15 @@ class StageLoopScopingTests(unittest.TestCase):
         source = (ROOT / "handler.py").read_text()
         self.assertIn('"stage1_ge": _STAGE1_GE_DEFAULT', source)
 
+    def test_extra_lora_download_is_revision_pinned_and_hash_verified(self) -> None:
+        source = (ROOT / "handler.py").read_text()
+        self.assertIn('EXTRA_LORA_REVISION = os.environ.get("LTX_EXTRA_LORA_REVISION")', source)
+        self.assertIn('os.environ.get("LTX_EXTRA_LORA_SHA256")', source)
+        self.assertIn("revision=EXTRA_LORA_REVISION", source)
+        self.assertIn("hashlib.sha256()", source)
+        self.assertIn("extra LoRA sha256 mismatch", source)
+        self.assertIn('f"-xsha{EXTRA_LORA_SHA256[:8]}"', source)
+
 
 class PromptAndDecoderWiringTests(unittest.TestCase):
     def test_run_case_reads_case_negative_prompt(self) -> None:

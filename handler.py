@@ -71,6 +71,7 @@ FA3 via LTX_ATTENTION_TYPE.
 import base64
 import contextlib
 import glob
+import hashlib
 import json
 import math
 import os
@@ -164,8 +165,12 @@ S1_LORA_STRENGTH = float(os.environ.get("LTX_S1_LORA_STRENGTH", "0"))
 # Downloaded from its own HF repo at init only when LTX_EXTRA_LORA_REPO is set. Independent s1/s2 strength.
 EXTRA_LORA_REPO = os.environ.get("LTX_EXTRA_LORA_REPO") or None      # e.g. LiconStudio/Ltx2.3-VBVR-lora-I2V
 EXTRA_LORA_FILE = os.environ.get("LTX_EXTRA_LORA_FILE") or None      # e.g. Ltx2.3-Licon-VBVR-I2V-390K-R32.safetensors
+EXTRA_LORA_REVISION = os.environ.get("LTX_EXTRA_LORA_REVISION") or None
+EXTRA_LORA_SHA256 = (os.environ.get("LTX_EXTRA_LORA_SHA256") or "").strip().lower() or None
 EXTRA_LORA_S1 = float(os.environ.get("LTX_EXTRA_LORA_S1", "0"))      # stage1 strength
 EXTRA_LORA_S2 = float(os.environ.get("LTX_EXTRA_LORA_S2", "0"))      # stage2 refiner strength
+if EXTRA_LORA_SHA256 and not re.fullmatch(r"[0-9a-f]{64}", EXTRA_LORA_SHA256):
+    raise ValueError("LTX_EXTRA_LORA_SHA256 must be exactly 64 lowercase/uppercase hex characters")
 # Default stage1 step count for the fast tier; request "steps" still wins. 12 = v8.5 behavior.
 FAST_DEFAULT_STEPS = int(os.environ.get("LTX_FAST_DEFAULT_STEPS", "12"))
 # Default stage1 sigma grid for the fast tier (JSON list). When set, it replaces the
@@ -224,6 +229,7 @@ CAS_MIX_DEFAULT = float(os.environ.get("LTX_CAS_MIX", "0.7"))
 CONFIG_TAG = (os.environ.get("LTX_CONFIG_TAG", "v8")
               + (f"-s1_{S1_LORA_STRENGTH:g}" if S1_LORA_STRENGTH > 0 else "")
               + (f"-xlora{EXTRA_LORA_S1:g}_{EXTRA_LORA_S2:g}" if EXTRA_LORA_REPO else "")
+              + (f"-xsha{EXTRA_LORA_SHA256[:8]}" if EXTRA_LORA_SHA256 else "")
               + (f"-st{FAST_DEFAULT_STEPS}" if FAST_DEFAULT_STEPS != 12 else "")
               + (f"-fsig{len(FAST_SIGMAS_DEFAULT) - 1}" if FAST_SIGMAS_DEFAULT else "")
               + (f"-cas{CAS_AMOUNT_DEFAULT:g}" if CAS_AMOUNT_DEFAULT > 0 else "")
@@ -924,8 +930,28 @@ def _init():
                 # v8.16 fix: RunPod cached-model workers force HF_HUB_OFFLINE on, which blocked this
                 # download (v8.15 init crash). Scrub it for the fetch (same trick as log_uploader.py).
                 os.environ.pop("HF_HUB_OFFLINE", None); os.environ.pop("TRANSFORMERS_OFFLINE", None)
-                extra_lora_path = hf_hub_download(EXTRA_LORA_REPO, EXTRA_LORA_FILE)
-                _INIT_LOG.append(f"extra LoRA {EXTRA_LORA_REPO}/{EXTRA_LORA_FILE} s1={EXTRA_LORA_S1} s2={EXTRA_LORA_S2}")
+                extra_lora_path = hf_hub_download(
+                    EXTRA_LORA_REPO,
+                    EXTRA_LORA_FILE,
+                    revision=EXTRA_LORA_REVISION,
+                )
+                resolved_extra_lora_sha256 = hashlib.sha256()
+                with open(extra_lora_path, "rb") as extra_lora_file:
+                    for chunk in iter(lambda: extra_lora_file.read(8 * 1024 * 1024), b""):
+                        resolved_extra_lora_sha256.update(chunk)
+                resolved_extra_lora_sha256 = resolved_extra_lora_sha256.hexdigest()
+                if EXTRA_LORA_SHA256 and resolved_extra_lora_sha256 != EXTRA_LORA_SHA256:
+                    raise RuntimeError(
+                        "extra LoRA sha256 mismatch: "
+                        f"expected {EXTRA_LORA_SHA256}, got {resolved_extra_lora_sha256}"
+                    )
+                _INIT_LOG.append(
+                    "extra LoRA "
+                    f"{EXTRA_LORA_REPO}/{EXTRA_LORA_FILE} "
+                    f"revision={EXTRA_LORA_REVISION or 'main'} "
+                    f"sha256={resolved_extra_lora_sha256} "
+                    f"s1={EXTRA_LORA_S1} s2={EXTRA_LORA_S2}"
+                )
                 # v8.20: IC-LoRAs carry their reference downscale in safetensors metadata (ref0.5 => 2).
                 from ltx_pipelines.iclora_utils import read_lora_reference_downscale_factor
                 _REF_DOWNSCALE["factor"] = read_lora_reference_downscale_factor(extra_lora_path)
