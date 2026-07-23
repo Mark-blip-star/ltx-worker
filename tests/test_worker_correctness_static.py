@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import math
 import unittest
 from pathlib import Path
 
@@ -104,6 +105,68 @@ class PromptAndDecoderWiringTests(unittest.TestCase):
         self.assertIn('decode_noise_scale=settings.get("decode_noise")', runner)
         self.assertNotIn("LTX_DECODE_NOISE_SCALE", handler)
         self.assertNotIn("LTX_DECODE_NOISE_SCALE", runner)
+
+    def test_resident_decoder_accepts_override_and_resets_default(self) -> None:
+        tree = ast.parse((ROOT / "handler.py").read_text())
+        resident_decoder = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "_ResidentDecoder"
+        )
+        namespace = {"math": math}
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=[resident_decoder], type_ignores=[]),
+                ),
+                str(ROOT / "handler.py"),
+                "exec",
+            ),
+            namespace,
+        )
+
+        class FakeDecoder:
+            decode_noise_scale = 0.025
+
+            def to(self, _device):
+                return self
+
+            def eval(self):
+                return self
+
+            def decode_video(self, latent, tiling_config, generator):
+                return latent, tiling_config, generator, self.decode_noise_scale
+
+        decoder = FakeDecoder()
+
+        class FakeBuilder:
+            def build(self, *, device, dtype):
+                self.args = (device, dtype)
+                return decoder
+
+        inner = type(
+            "Inner",
+            (),
+            {
+                "_decoder_builder": FakeBuilder(),
+                "_device": "cuda",
+                "_dtype": "bf16",
+            },
+        )()
+        resident = namespace["_ResidentDecoder"](inner)
+
+        self.assertEqual(
+            resident("latent", decode_noise_scale=0.1)[-1],
+            0.1,
+        )
+        self.assertEqual(resident.last_decode_noise_scale, 0.1)
+        self.assertEqual(resident("latent")[-1], 0.025)
+        self.assertEqual(resident.last_decode_noise_scale, 0.025)
+        for invalid in (-0.001, 0.251, math.nan, math.inf):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    resident("latent", decode_noise_scale=invalid)
 
     def test_effective_config_is_returned(self) -> None:
         source = (ROOT / "handler.py").read_text()

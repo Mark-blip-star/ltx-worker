@@ -72,6 +72,7 @@ import base64
 import contextlib
 import glob
 import json
+import math
 import os
 import re
 import signal
@@ -304,8 +305,31 @@ class _ResidentUpsampler:
 class _ResidentDecoder:
     def __init__(self, inner):
         self._dec = inner._decoder_builder.build(device=inner._device, dtype=inner._dtype).to(inner._device).eval()
+        self._default_decode_noise_scale = float(self._dec.decode_noise_scale)
+        self.last_decode_noise_scale = self._default_decode_noise_scale
 
-    def __call__(self, latent, tiling_config=None, generator=None):
+    def __call__(
+        self,
+        latent,
+        tiling_config=None,
+        generator=None,
+        decode_noise_scale=None,
+    ):
+        # The stock VideoDecoder builds a fresh decoder per call, so an omitted
+        # request override naturally returns to the checkpoint default. This
+        # resident wrapper must reset explicitly or one request's override
+        # would leak into the next request.
+        resolved = (
+            self._default_decode_noise_scale
+            if decode_noise_scale is None
+            else float(decode_noise_scale)
+        )
+        if not math.isfinite(resolved) or not 0.0 <= resolved <= 0.25:
+            raise ValueError(
+                "decode_noise_scale must be finite and between 0 and 0.25"
+            )
+        self._dec.decode_noise_scale = resolved
+        self.last_decode_noise_scale = resolved
         return self._dec.decode_video(latent, tiling_config, generator)
 
 
