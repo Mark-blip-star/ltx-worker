@@ -242,6 +242,7 @@ def _guided_denoise(  # noqa: PLR0913,PLR0915
     pass_names = [name for name, _, _, _ in passes]
     ptb_configs = [ptb for _, _, _, ptb in passes]
     n = len(passes)
+    orig_b = (video_state or audio_state).latent.shape[0]
 
     def _batched_sigma(state: LatentState) -> torch.Tensor:
         """Expand scalar sigma to (n * B,) matching the repeated state."""
@@ -272,8 +273,18 @@ def _guided_denoise(  # noqa: PLR0913,PLR0915
         _sync_for_trace()
         transformer_start = time.perf_counter()
     _mark_cuda_graph_step()
+    batched_ptb_configs = [config for config in ptb_configs for _ in range(orig_b)]
+    reference = batched_video if batched_video is not None else batched_audio
+    perturbations = BatchedPerturbationConfig(
+        batched_ptb_configs,
+        num_blocks=transformer.num_blocks,
+        device=reference.latent.device,
+        dtype=reference.latent.dtype,
+    )
     all_v, all_a = transformer(
-        video=batched_video, audio=batched_audio, perturbations=BatchedPerturbationConfig(ptb_configs)
+        video=batched_video,
+        audio=batched_audio,
+        perturbations=perturbations,
     )
     if trace_enabled:
         _sync_for_trace()

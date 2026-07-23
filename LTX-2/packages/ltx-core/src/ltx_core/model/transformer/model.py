@@ -2,13 +2,14 @@ from enum import Enum
 
 import torch
 
-from ltx_core.guidance.perturbations import BatchedPerturbationConfig
+from ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
 from ltx_core.model.transformer.adaln import AdaLayerNormSingle, adaln_embedding_coefficient
 from ltx_core.model.transformer.attention import AttentionCallable, AttentionFunction
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.transformer import BasicAVTransformerBlock, TransformerConfig
 from ltx_core.model.transformer.transformer_args import (
+    BlockPerturbationsProcessor,
     MultiModalTransformerArgsPreprocessor,
     TransformerArgs,
     TransformerArgsPreprocessor,
@@ -118,6 +119,7 @@ class LTXModel(torch.nn.Module):
             attention_type=attention_type,
             apply_gated_attention=apply_gated_attention,
         )
+        self.block_input_processor = BlockPerturbationsProcessor()
 
     @property
     def _adaln_embedding_coefficient(self) -> int:
@@ -336,16 +338,37 @@ class LTXModel(torch.nn.Module):
         """
         self._enable_gradient_checkpointing = enable
 
+    @property
+    def num_blocks(self) -> int:
+        """Number of regional transformer blocks."""
+        return len(self.transformer_blocks)
+
     def _process_transformer_blocks(
         self,
         video: TransformerArgs | None,
         audio: TransformerArgs | None,
         perturbations: BatchedPerturbationConfig,
-    ) -> tuple[TransformerArgs, TransformerArgs]:
+    ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         """Process transformer blocks for LTXAV."""
 
-        # Process transformer blocks
-        for block in self.transformer_blocks:
+        for block_idx, block in enumerate(self.transformer_blocks):
+            if video is not None:
+                video = self.block_input_processor(
+                    video,
+                    perturbations,
+                    block_idx,
+                    self_attn_type=PerturbationType.SKIP_VIDEO_SELF_ATTN,
+                    cross_attn_type=PerturbationType.SKIP_A2V_CROSS_ATTN,
+                )
+            if audio is not None:
+                audio = self.block_input_processor(
+                    audio,
+                    perturbations,
+                    block_idx,
+                    self_attn_type=PerturbationType.SKIP_AUDIO_SELF_ATTN,
+                    cross_attn_type=PerturbationType.SKIP_V2A_CROSS_ATTN,
+                )
+
             if self._enable_gradient_checkpointing and self.training:
                 # Use gradient checkpointing to save memory during training.
                 # With use_reentrant=False, we can pass dataclasses directly -
@@ -354,15 +377,10 @@ class LTXModel(torch.nn.Module):
                     block,
                     video,
                     audio,
-                    perturbations,
                     use_reentrant=False,
                 )
             else:
-                video, audio = block(
-                    video=video,
-                    audio=audio,
-                    perturbations=perturbations,
-                )
+                video, audio = block(video=video, audio=audio)
 
         return video, audio
 
@@ -387,8 +405,11 @@ class LTXModel(torch.nn.Module):
         return x
 
     def forward(
-        self, video: Modality | None, audio: Modality | None, perturbations: BatchedPerturbationConfig
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        video: Modality | None,
+        audio: Modality | None,
+        perturbations: BatchedPerturbationConfig | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """
         Forward pass for LTX models.
         Returns:
@@ -401,6 +422,16 @@ class LTXModel(torch.nn.Module):
 
         video_args = self.video_args_preprocessor.prepare(video, audio) if video is not None else None
         audio_args = self.audio_args_preprocessor.prepare(audio, video) if audio is not None else None
+        if perturbations is None:
+            reference = video_args if video_args is not None else audio_args
+            if reference is None:
+                raise ValueError("At least one of video or audio must be provided")
+            perturbations = BatchedPerturbationConfig.empty(
+                reference.x.shape[0],
+                self.num_blocks,
+                reference.x.device,
+                reference.x.dtype,
+            )
         # Process transformer blocks
         video_out, audio_out = self._process_transformer_blocks(
             video=video_args,
@@ -440,11 +471,15 @@ class LegacyX0Model(torch.nn.Module):
         super().__init__()
         self.velocity_model = velocity_model
 
+    @property
+    def num_blocks(self) -> int:
+        return self.velocity_model.num_blocks
+
     def forward(
         self,
         video: Modality | None,
         audio: Modality | None,
-        perturbations: BatchedPerturbationConfig,
+        perturbations: BatchedPerturbationConfig | None,
         sigma: float,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """
@@ -469,11 +504,15 @@ class X0Model(torch.nn.Module):
         super().__init__()
         self.velocity_model = velocity_model
 
+    @property
+    def num_blocks(self) -> int:
+        return self.velocity_model.num_blocks
+
     def forward(
         self,
         video: Modality | None,
         audio: Modality | None,
-        perturbations: BatchedPerturbationConfig,
+        perturbations: BatchedPerturbationConfig | None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """
         Denoise the video and audio according to the sigma.

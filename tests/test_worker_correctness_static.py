@@ -208,7 +208,13 @@ class PromptAndDecoderWiringTests(unittest.TestCase):
 
     def test_slim_build_fails_on_application_syntax_errors(self) -> None:
         source = (ROOT / "Dockerfile.slim").read_text()
-        self.assertIn("import request_config, stage_timing_runner", source)
+        for module in (
+            "regional_compile_config",
+            "request_config",
+            "stage_timing_runner",
+        ):
+            with self.subTest(module=module):
+                self.assertIn(module, source)
         self.assertIn("python -m py_compile", source)
         self.assertIn("/app/request_config.py /app/stage_timing_runner.py /app/handler.py", source)
         self.assertIn("ruff check --select F821", source)

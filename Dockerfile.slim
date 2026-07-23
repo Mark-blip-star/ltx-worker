@@ -10,7 +10,7 @@ ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 \
     UV_PYTHON_INSTALL_DIR=/opt/uv-python UV_LINK_MODE=copy
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl ca-certificates libgomp1 && \
+      curl ca-certificates g++ libgomp1 && \
     rm -rf /var/lib/apt/lists/*
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -49,6 +49,7 @@ RUN uv pip install --python "$VENV/bin/python" "onnxruntime-gpu==1.20.1" opencv-
 # --- app code (hot layer: changes here don't rebuild venv) ---
 COPY stage_timing_runner.py /app/stage_timing_runner.py
 COPY request_config.py /app/request_config.py
+COPY regional_compile_config.py /app/regional_compile_config.py
 COPY handler.py /app/handler.py
 COPY log_uploader.py /app/log_uploader.py
 COPY start.sh /app/start.sh
@@ -56,15 +57,15 @@ COPY warmup.jpg /app/warmup.jpg
 COPY dwpose_vendor /app/dwpose_vendor
 
 # Import smoke-test (CPU-only; catches missing .so + that handler's run_case path imports cleanly)
-RUN cd /app && /app/LTX-2/.venv/bin/python -c "import torch, numpy, PIL, av, OpenImageIO; import ltx_core.loader; import ltx_pipelines.ti2vid_two_stages, ltx_pipelines.iclora_utils; import request_config, stage_timing_runner; import dwpose_vendor; from insightface.app import FaceAnalysis; import ctypes; ctypes.CDLL('libcudnn.so.9'); print('IMPORT SMOKE OK', torch.__version__)" && \
+RUN cd /app && /app/LTX-2/.venv/bin/python -c "import torch, numpy, PIL, av, OpenImageIO; import ltx_core.loader; import ltx_pipelines.ti2vid_two_stages, ltx_pipelines.iclora_utils; import regional_compile_config, request_config, stage_timing_runner; import dwpose_vendor; from insightface.app import FaceAnalysis; import ctypes; ctypes.CDLL('libcudnn.so.9'); print('IMPORT SMOKE OK', torch.__version__)" && \
     /app/LTX-2/.venv/bin/python -m py_compile \
-      /app/request_config.py /app/stage_timing_runner.py /app/handler.py && \
+      /app/regional_compile_config.py /app/request_config.py /app/stage_timing_runner.py /app/handler.py && \
     cd /app/LTX-2 && /app/LTX-2/.venv/bin/ruff check --select F821 \
-      /app/request_config.py /app/stage_timing_runner.py /app/handler.py
+      /app/regional_compile_config.py /app/request_config.py /app/stage_timing_runner.py /app/handler.py
 
 # I-3: precompile bytecode so cold boots skip py-compile + stat/hash checks
 RUN /app/LTX-2/.venv/bin/python -m compileall -j 0 -q --invalidation-mode unchecked-hash \
-      /app/LTX-2/.venv/lib /app/stage_timing_runner.py /app/request_config.py \
+      /app/LTX-2/.venv/lib /app/stage_timing_runner.py /app/request_config.py /app/regional_compile_config.py \
       /app/handler.py /app/log_uploader.py || true
 
 # Weights repo provided at runtime via RunPod Cached Models (env LTX_WEIGHTS_REPO).

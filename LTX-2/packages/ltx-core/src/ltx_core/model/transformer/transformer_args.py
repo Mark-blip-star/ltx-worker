@@ -2,6 +2,7 @@ from dataclasses import dataclass, replace
 
 import torch
 
+from ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
 from ltx_core.model.transformer.adaln import AdaLayerNormSingle
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.rope import (
@@ -19,8 +20,8 @@ class TransformerArgs:
     context_mask: torch.Tensor
     timesteps: torch.Tensor
     embedded_timestep: torch.Tensor
-    positional_embeddings: torch.Tensor
-    cross_positional_embeddings: torch.Tensor | None
+    positional_embeddings: tuple[torch.Tensor, torch.Tensor]
+    cross_positional_embeddings: tuple[torch.Tensor, torch.Tensor] | None
     cross_scale_shift_timestep: torch.Tensor | None
     cross_gate_timestep: torch.Tensor | None
     enabled: bool
@@ -28,6 +29,39 @@ class TransformerArgs:
     self_attention_mask: torch.Tensor | None = (
         None  # Additive log-space self-attention bias (B, 1, T, T), None = full attention
     )
+    self_attn_perturbation_mask: torch.Tensor | None = None
+    self_attn_all_perturbed: bool = False
+    cross_attn_perturbation_mask: torch.Tensor | None = None
+    cross_attn_skip_all: bool = False
+
+
+class BlockPerturbationsProcessor:
+    """Attach one block's eager perturbation shortcuts and runtime masks."""
+
+    def __call__(
+        self,
+        args: TransformerArgs,
+        perturbations: BatchedPerturbationConfig,
+        block_idx: int,
+        self_attn_type: PerturbationType,
+        cross_attn_type: PerturbationType,
+    ) -> TransformerArgs:
+        all_self = perturbations.all_in_batch(self_attn_type, block_idx)
+        any_self = perturbations.any_in_batch(self_attn_type, block_idx)
+        self_mask = None
+        if any_self and not all_self:
+            self_mask = perturbations.mask(self_attn_type, block_idx)
+
+        all_cross = perturbations.all_in_batch(cross_attn_type, block_idx)
+        cross_mask = None if all_cross else perturbations.mask(cross_attn_type, block_idx)
+
+        return replace(
+            args,
+            self_attn_perturbation_mask=self_mask,
+            self_attn_all_perturbed=all_self,
+            cross_attn_perturbation_mask=cross_mask,
+            cross_attn_skip_all=all_cross,
+        )
 
 
 class TransformerArgsPreprocessor:
@@ -130,7 +164,7 @@ class TransformerArgsPreprocessor:
         use_middle_indices_grid: bool,
         num_attention_heads: int,
         x_dtype: torch.dtype,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Prepare positional embeddings."""
         freq_grid_generator = generate_freq_grid_np if self.double_precision_rope else generate_freq_grid_pytorch
         pe = precompute_freqs_cis(

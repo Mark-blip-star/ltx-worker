@@ -495,7 +495,16 @@ class ValidationSampler:
         stg_guider = STGGuider(config.stg_scale)
 
         # Build STG perturbation config if STG is enabled
-        stg_perturbation_config = self._build_stg_perturbation_config(config) if stg_guider.enabled() else None
+        stg_perturbation_config = (
+            self._build_stg_perturbation_config(
+                config,
+                num_blocks=self._transformer.num_blocks,
+                device=device,
+                dtype=video_state.latent.dtype,
+            )
+            if stg_guider.enabled()
+            else None
+        )
 
         # Create initial modalities (will be updated each step via replace())
         video = Modality(
@@ -599,7 +608,13 @@ class ValidationSampler:
         return video_state, audio_state
 
     @staticmethod
-    def _build_stg_perturbation_config(config: GenerationConfig) -> BatchedPerturbationConfig:
+    def _build_stg_perturbation_config(
+        config: GenerationConfig,
+        *,
+        num_blocks: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> BatchedPerturbationConfig:
         """Build the perturbation config for STG based on the stg_mode."""
         # Always skip video self-attention for STG
         perturbations: list[Perturbation] = [
@@ -612,7 +627,12 @@ class ValidationSampler:
 
         perturbation_config = PerturbationConfig(perturbations=perturbations)
         # Batch size is 1 for validation
-        return BatchedPerturbationConfig(perturbations=[perturbation_config])
+        return BatchedPerturbationConfig(
+            perturbations=[perturbation_config],
+            num_blocks=num_blocks,
+            device=device,
+            dtype=dtype,
+        )
 
     def _decode_video_latent(self, latent: Tensor, config: GenerationConfig, device: torch.device) -> Tensor:
         """Decode patchified video latent to pixel space."""

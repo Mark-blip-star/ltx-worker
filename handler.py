@@ -83,6 +83,8 @@ import traceback
 import types
 from pathlib import Path
 
+from regional_compile_config import RegionalCompileSettings
+
 _T0 = time.monotonic()
 
 
@@ -96,6 +98,8 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("LTX_ATTENTION_TYPE", "flash_attention_3")  # critical: vanilla attn OOMs
 os.environ.setdefault("LTX_FAST_VAE", "1")
 os.environ.setdefault("LTX_TGATE_START_STEP", "10")
+_REGIONAL_COMPILE_SETTINGS = RegionalCompileSettings.from_environ(os.environ)
+_REGIONAL_COMPILE_SETTINGS.prepare_environment(os.environ)
 
 import torch  # noqa: E402
 import runpod  # noqa: E402
@@ -110,6 +114,7 @@ from request_config import (  # noqa: E402
 )
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps  # noqa: E402
 from ltx_core.loader.registry import StateDictRegistry  # noqa: E402
+from ltx_core.model.transformer.compiling import CompilationConfig, compile_transformer  # noqa: E402
 from ltx_core.quantization import QuantizationPolicy  # noqa: E402
 from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline  # noqa: E402
 from ltx_pipelines.utils.blocks import PromptEncoder  # noqa: E402
@@ -214,7 +219,8 @@ CONFIG_TAG = (os.environ.get("LTX_CONFIG_TAG", "v8")
               + (f"-xlora{EXTRA_LORA_S1:g}_{EXTRA_LORA_S2:g}" if EXTRA_LORA_REPO else "")
               + (f"-st{FAST_DEFAULT_STEPS}" if FAST_DEFAULT_STEPS != 12 else "")
               + (f"-fsig{len(FAST_SIGMAS_DEFAULT) - 1}" if FAST_SIGMAS_DEFAULT else "")
-              + (f"-cas{CAS_AMOUNT_DEFAULT:g}" if CAS_AMOUNT_DEFAULT > 0 else ""))
+              + (f"-cas{CAS_AMOUNT_DEFAULT:g}" if CAS_AMOUNT_DEFAULT > 0 else "")
+              + ("-rc-s1" if _REGIONAL_COMPILE_SETTINGS.stage1 else ""))
 # v8.7 switches. All default-off so an env-clean v8.7 binary is path-identical to v8.6.1
 # except the always-on bit-exact changes (resident tail, stream-yield decode), gated by PSNR.
 SKIP_NEG_ENCODE = os.environ.get("LTX_SKIP_NEG_ENCODE", "0") == "1"  # bit-exact: prompts encode sequentially
@@ -241,6 +247,89 @@ _INIT_LOG = []
 _INIT_LOCK = threading.Lock()
 _GEMMA_DIR = None  # resolved gemma-fp8 snapshot subdir (cache-key/meta only after L-2)
 _FIRST_JOB_SEEN = False
+_REGIONAL_COMPILE_STATE = {
+    "config": _REGIONAL_COMPILE_SETTINGS.telemetry(),
+    "runtime": {},
+    "stages": {},
+}
+
+
+def _regional_compile_snapshot() -> dict[str, object]:
+    """Return JSON-safe compile telemetry without exposing mutable state."""
+    return json.loads(json.dumps(_REGIONAL_COMPILE_STATE, sort_keys=True))
+
+
+def _compiler_counter_snapshot() -> dict[str, dict[str, int]]:
+    """Collect bounded Dynamo/Inductor counters after the readiness warmup."""
+    try:
+        from torch._dynamo.utils import counters
+    except Exception:  # noqa: BLE001
+        return {}
+
+    snapshot = {}
+    for category in ("frames", "stats", "graph_break", "inductor", "aot_autograd"):
+        values = counters.get(category)
+        if not values:
+            continue
+        ranked = sorted(values.items(), key=lambda item: (-int(item[1]), str(item[0])))[:20]
+        snapshot[category] = {str(key): int(value) for key, value in ranked}
+    return snapshot
+
+
+def _compile_resident_stage(cache_key: str, transformer: torch.nn.Module) -> None:
+    """Wrap an already loaded/fused resident stage in the safe regional compiler."""
+    if cache_key != "stage1" or not _REGIONAL_COMPILE_SETTINGS.stage1:
+        return
+
+    velocity_model = getattr(transformer, "velocity_model", None)
+    if velocity_model is None:
+        raise TypeError(f"{cache_key} resident transformer has no velocity_model")
+    if bool(torch._dynamo.config.suppress_errors):  # type: ignore[attr-defined]
+        raise RuntimeError("regional compile refuses torch._dynamo.config.suppress_errors=True")
+
+    try:
+        import triton
+
+        triton_version = triton.__version__
+    except Exception as exc:  # noqa: BLE001
+        triton_version = f"unavailable:{type(exc).__name__}"
+
+    runtime = {
+        "torch": torch.__version__,
+        "triton": triton_version,
+        "cuda_runtime": torch.version.cuda,
+        "device": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
+        "device_capability": list(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None,
+        "torch_logs": os.environ.get("TORCH_LOGS"),
+    }
+    _REGIONAL_COMPILE_STATE["runtime"] = runtime
+    stage_state = {
+        "status": "wrapping",
+        "cache_key": cache_key,
+        "blocks": len(velocity_model.transformer_blocks),
+    }
+    _REGIONAL_COMPILE_STATE["stages"][cache_key] = stage_state
+
+    started = time.perf_counter()
+    compile_transformer(
+        velocity_model,
+        CompilationConfig(
+            mode=None,
+            backend="inductor",
+            fullgraph=False,
+            dynamic=None,
+        ),
+    )
+    stage_state.update(
+        {
+            "status": "wrapped_lazy",
+            "wrap_seconds": round(time.perf_counter() - started, 6),
+        }
+    )
+    _INIT_LOG.append(
+        f"regional compile {cache_key} wrapped {stage_state['blocks']} blocks "
+        f"in {stage_state['wrap_seconds']}s (mode=default, guards=on)"
+    )
 
 
 class _StageKeyedCache(base.ResidentStageCache):
@@ -254,6 +343,17 @@ class _StageKeyedCache(base.ResidentStageCache):
     def get(self, stage, cache_key, **kw):
         hit = cache_key in self._entries
         out = super().get(stage, cache_key, **kw)
+        if not hit and cache_key == "stage1" and _REGIONAL_COMPILE_SETTINGS.stage1:
+            try:
+                _compile_resident_stage(cache_key, out)
+            except Exception as exc:
+                stage_state = _REGIONAL_COMPILE_STATE["stages"].setdefault(cache_key, {})
+                stage_state.update({"status": "failed", "error": f"{type(exc).__name__}: {exc}"})
+                entry = self._entries.pop(cache_key, None)
+                if entry is not None:
+                    entry["model_ctx"].__exit__(type(exc), exc, exc.__traceback__)
+                torch.cuda.empty_cache()
+                raise
         # v8.6.1: with the distilled LoRA fused into stage1 too, no live model shares the
         # registry's base SD — drop it after each stage build so at most two transformer
         # copies stay resident (three + activations busts the 94GB H100 NVL).
@@ -665,16 +765,11 @@ class OnGPUFp8GemmaBuilder(base.PrequantCausalGemmaBuilder):
         if left_meta:
             raise RuntimeError(f"enhance-gemma params left on meta: {left_meta[:5]} (missing={list(missing)[:5]})")
         model = model.to(target).eval()
-        # The slim image ships NO C compiler. Gemma3.generate() defaults to a static/"hybrid" KV
-        # cache whose forward is torch.compile'd (Triton -> needs cc) and crashes with
-        # "Failed to find C compiler". Force the eager dynamic cache so enhance never compiles.
-        # (Our video generation never hits this — it runs FA3 + torch._scaled_mm, torch_compile=False.)
+        # Gemma3.generate() defaults to a compiled static/"hybrid" KV cache. Keep prompt
+        # enhancement on its eager dynamic cache: the only compiler canary in this worker is the
+        # explicitly gated video transformer path. Do not set Dynamo's process-global
+        # suppress_errors flag; a requested video compile must fail closed.
         model.generation_config.cache_implementation = "dynamic"
-        try:
-            import torch._dynamo as _dynamo
-            _dynamo.config.suppress_errors = True  # belt: any stray compile falls back to eager
-        except Exception:  # noqa: BLE001
-            pass
         base.sync_cuda()
         proc_root = str(find_matching_file(self._model_root, "preprocessor_config.json").parent)
         image_processor = AutoImageProcessor.from_pretrained(proc_root, local_files_only=True)
@@ -718,7 +813,11 @@ def _warmup_generation():
     out = _OUT / rec["output"]
     if os.path.exists(out):
         os.remove(out)
-    _INIT_LOG.append(f"warmup-gen ok in {_t.time() - t0:.1f}s; timers={rec.get('timers')}")
+    warmup_seconds = round(_t.time() - t0, 3)
+    if _REGIONAL_COMPILE_SETTINGS.enabled:
+        _REGIONAL_COMPILE_STATE["warmup_generation_seconds"] = warmup_seconds
+        _REGIONAL_COMPILE_STATE["warmup_timers"] = rec.get("timers")
+    _INIT_LOG.append(f"warmup-gen ok in {warmup_seconds:.1f}s; timers={rec.get('timers')}")
 
 
 def _init():
@@ -730,6 +829,7 @@ def _init():
             return
         try:
             _mark("init_start")
+            _INIT_LOG.append(f"regional_compile={json.dumps(_REGIONAL_COMPILE_SETTINGS.telemetry(), sort_keys=True)}")
             snap = _resolve_repo()
             _mark("snapshot_resolved")
             ckpt = os.path.join(snap, FP8_CKPT_NAME)
@@ -836,11 +936,25 @@ def _init():
             pipe.prompt_encoder = enc
             _PIPE = pipe
             _INIT_LOG.append("pipeline built — ready")
-            if WARMUP_GEN:
+            if WARMUP_GEN or _REGIONAL_COMPILE_SETTINGS.enabled:
                 try:
                     _warmup_generation()
+                    if _REGIONAL_COMPILE_SETTINGS.enabled:
+                        stage_state = _REGIONAL_COMPILE_STATE["stages"].get("stage1")
+                        if stage_state is None or stage_state.get("status") != "wrapped_lazy":
+                            raise RuntimeError("stage1 regional compile was not wrapped during mandatory warmup")
+                        stage_state["status"] = "warmed"
+                        _REGIONAL_COMPILE_STATE["post_warmup"] = {
+                            "compiler_counters": _compiler_counter_snapshot(),
+                            "cuda_allocated_gib": round(torch.cuda.memory_allocated() / 2**30, 3),
+                            "cuda_reserved_gib": round(torch.cuda.memory_reserved() / 2**30, 3),
+                            "cuda_max_allocated_gib": round(torch.cuda.max_memory_allocated() / 2**30, 3),
+                            "cuda_max_reserved_gib": round(torch.cuda.max_memory_reserved() / 2**30, 3),
+                        }
                     _mark("warmup_gen_done")
                 except Exception as exc:  # noqa: BLE001
+                    if _REGIONAL_COMPILE_SETTINGS.enabled:
+                        raise RuntimeError("mandatory regional compile warmup failed") from exc
                     _INIT_LOG.append(f"warmup-gen FAILED (non-fatal): {exc!r}")
                     _mark("warmup_gen_failed")
             _mark("ready")
@@ -1242,7 +1356,10 @@ def handler(job):
         return {"error": "INIT_FAILED", "trace": _INIT_ERR}
     inp = job.get("input", {})
     if inp.get("warm"):  # H-7: keep-warm ping — init done, no generation; prewarm keeps running
-        return {"warm": "ok", "config_tag": CONFIG_TAG}
+        response = {"warm": "ok", "config_tag": CONFIG_TAG}
+        if _REGIONAL_COMPILE_SETTINGS.enabled:
+            response["regional_compile"] = _regional_compile_snapshot()
+        return response
     if inp.get("enhance_probe"):  # diagnostics: confirm vision-Gemma loaded + sample rewrite + VRAM
         if not ENHANCE_VISION:
             return {"enhance_probe": "LTX_ENHANCE_VISION not enabled", "config_tag": CONFIG_TAG}
@@ -1591,6 +1708,8 @@ def handler(job):
                 },
             },
         }
+        if _REGIONAL_COMPILE_SETTINGS.enabled:
+            resp["effective_config"]["regional_compile"] = _regional_compile_snapshot()
         if meme_mode:
             resp["pose_seconds"] = pose_seconds
             resp["frames"] = settings["frames"]
