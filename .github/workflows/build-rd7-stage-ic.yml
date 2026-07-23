@@ -1,0 +1,59 @@
+name: build-worker-image-rd7-stage-ic
+
+# One-shot R&D build for the request-local, two-stage image-conditioning probe.
+# The paths filter prevents later benchmark/documentation pushes from rebuilding it.
+on:
+  push:
+    branches:
+      - quality-rd-20260723
+    paths:
+      - .github/workflows/build-rd7-stage-ic.yml
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Run worker regression tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Login to ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: mark-blip-star
+          password: ${{ secrets.GHCR_PAT }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.slim
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ghcr.io/mark-blip-star/ltx-worker-slim:v8.26.0-rd7-stage-ic-gb812e95-b1
+          cache-from: type=registry,ref=ghcr.io/mark-blip-star/ltx-worker-slim:v8.25.2-rd6-strength-gb063c4f-b1
+          cache-to: type=inline
+
+      - name: Verify pushed manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect \
+            ghcr.io/mark-blip-star/ltx-worker-slim:v8.26.0-rd7-stage-ic-gb812e95-b1 \
+            > "${RUNNER_TEMP}/pushed-image-inspect.txt"
+          head -5 "${RUNNER_TEMP}/pushed-image-inspect.txt"
+          echo "PUSH_VERIFIED"
