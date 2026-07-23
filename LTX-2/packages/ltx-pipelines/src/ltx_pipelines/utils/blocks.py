@@ -7,6 +7,7 @@ removes the need for :class:`ModelLedger`.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -585,9 +586,19 @@ class VideoDecoder:
         latent: torch.Tensor,
         tiling_config: TilingConfig | None = None,
         generator: torch.Generator | None = None,
+        decode_noise_scale: float | None = None,
     ) -> Iterator[torch.Tensor]:
         """Decode *latent* to pixel-space video chunks. Decoder freed after exhaustion."""
+        if decode_noise_scale is not None:
+            resolved = float(decode_noise_scale)
+            if not math.isfinite(resolved) or not 0.0 <= resolved <= 0.25:
+                raise ValueError("decode_noise_scale must be finite and between 0 and 0.25")
         decoder = self._decoder_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
+        if decode_noise_scale is not None:
+            decoder.decode_noise_scale = resolved
+        # The builder creates a fresh decoder for every call. Capture the value
+        # from that exact instance for response telemetry.
+        self.last_decode_noise_scale = float(decoder.decode_noise_scale)
         return _cleanup_iter(decoder.decode_video(latent, tiling_config, generator), decoder)
 
 

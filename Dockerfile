@@ -9,6 +9,7 @@ WORKDIR /app
 
 # 1. Code (our patched LTX-2 + handler)
 COPY LTX-2 /app/LTX-2
+COPY request_config.py /app/request_config.py
 COPY handler.py /app/handler.py
 COPY warmup.jpg /app/warmup.jpg
 

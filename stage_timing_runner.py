@@ -53,6 +53,10 @@ from ltx_pipelines.utils.constants import DEFAULT_NEGATIVE_PROMPT, LTX_2_3_PARAM
 from ltx_pipelines.utils.denoisers import FactoryGuidedDenoiser, SimpleDenoiser
 from ltx_pipelines.utils.helpers import combined_image_conditionings, generate_enhanced_prompt
 from ltx_pipelines.utils.media_io import encode_video
+from ltx_pipelines.utils.samplers import (
+    euler_denoising_loop,
+    gradient_estimating_euler_denoising_loop,
+)
 from ltx_pipelines.utils.types import ModalitySpec
 
 
@@ -1050,6 +1054,7 @@ def run_stage_with_optional_cuda_graphs(  # noqa: PLR0913
     fps: float,
     video: ModalitySpec | None,
     audio: ModalitySpec | None,
+    loop: Callable[..., tuple[Any, Any]] | None = None,
     max_batch_size: int = 1,
     lifecycle_stats: dict[str, Any] | None = None,
     resident_stage_cache: ResidentStageCache | None = None,
@@ -1070,6 +1075,7 @@ def run_stage_with_optional_cuda_graphs(  # noqa: PLR0913
             fps=fps,
             video=video,
             audio=audio,
+            loop=loop,
             max_batch_size=max_batch_size,
         )
 
@@ -1147,6 +1153,7 @@ def run_stage_with_optional_cuda_graphs(  # noqa: PLR0913
                     fps=fps,
                     video=video,
                     audio=audio,
+                    loop=loop,
                     max_batch_size=max_batch_size,
                 )
             sync_cuda()
@@ -1230,17 +1237,6 @@ def _cas_sharpen_chunk(chunk: torch.Tensor, amount: float, mix: float) -> torch.
     return out.permute(0, 2, 3, 1).to(orig_dtype)
 
 
-def _maybe_decode_noise_scale_override() -> None:
-    """v8.10 L5 sweep knob. When LTX_DECODE_NOISE_SCALE is set, override the VAE decoder's
-    class-default decode_noise_scale (read per-instance at decode time). No-op when unset =>
-    bit-exact to v8.9. Idempotent."""
-    raw = os.environ.get("LTX_DECODE_NOISE_SCALE")
-    if raw is None:
-        return
-    from ltx_core.model.video_vae.video_vae import VideoDecoder as _VaeVideoDecoder
-    _VaeVideoDecoder.decode_noise_scale = float(raw)
-
-
 def _maybe_cas(decoded, settings: dict):
     """Wrap the decoded-video iterator (or tensor) with CAS. Default-on; lazy."""
     amount = float(settings.get("cas_amount", _CAS_AMOUNT_DEFAULT))
@@ -1288,6 +1284,9 @@ def run_case(
         "guidance_trace_file": None,
         "guidance_factory": None,
         "model_lifecycle": {},
+        "negative_prompt_source": case.get("negative_prompt_source", "default"),
+        "effective_decode_noise_scale": None,
+        "effective_cas": None,
     }
     trace_file = None
     if args.guidance_trace_dir:
@@ -1324,8 +1323,9 @@ def run_case(
     chunks = get_video_chunks_number(settings["frames"], tiling_config or TilingConfig.default())
 
     def encode_prompt() -> tuple[Any, Any]:
+        negative_prompt = case.get("negative_prompt", DEFAULT_NEGATIVE_PROMPT)
         return pipeline.prompt_encoder(
-            [case["prompt"], DEFAULT_NEGATIVE_PROMPT],
+            [case["prompt"], negative_prompt],
             enhance_first_prompt=False,
             enhance_prompt_image=(None if t2v else image.path),
             enhance_prompt_seed=case["seed"],
@@ -1336,9 +1336,10 @@ def run_case(
         if prompt_cache is None:
             ctx_p, ctx_n = encode_prompt()
         else:
+            negative_prompt = case.get("negative_prompt", DEFAULT_NEGATIVE_PROMPT)
             prompt_key = prompt_cache.key(
                 prompt=case["prompt"],
-                negative_prompt=DEFAULT_NEGATIVE_PROMPT,
+                negative_prompt=negative_prompt,
                 image_path=(Path(image.path) if image else None),
                 seed=case["seed"],
                 gemma_root=args.gemma_root,
@@ -1444,6 +1445,11 @@ def run_case(
             fps=settings["fps"],
             video=ModalitySpec(context=v_context_p, conditionings=stage_1_conditionings),
             audio=None if os.environ.get("LTX_NO_AUDIO") == "1" else ModalitySpec(context=a_context_p),
+            loop=(
+                gradient_estimating_euler_denoising_loop
+                if bool(settings.get("stage1_ge", False))
+                else euler_denoising_loop
+            ),
             max_batch_size=1,
             lifecycle_stats=record["model_lifecycle"].setdefault("stage1", {})
             if args.profile_model_lifecycle
@@ -1554,6 +1560,7 @@ def run_case(
                 noise_scale=stage_2_sigmas[0].item(),
                 initial_latent=audio_state.latent,
             ),
+            loop=euler_denoising_loop,
             lifecycle_stats=record["model_lifecycle"].setdefault("stage2", {})
             if args.profile_model_lifecycle
             else None,
@@ -1561,9 +1568,18 @@ def run_case(
         )
     record["vram_after"]["stage2_transformer"] = peak_vram_gib()
 
-    _maybe_decode_noise_scale_override()  # v8.10 L5: no-op unless LTX_DECODE_NOISE_SCALE set
     with timed(timers, "video_vae_decode"):
-        decoded_video = pipeline.video_decoder(video_state.latent, tiling_config, generator)
+        decoded_video = pipeline.video_decoder(
+            video_state.latent,
+            tiling_config,
+            generator,
+            decode_noise_scale=settings.get("decode_noise"),
+        )
+    record["effective_decode_noise_scale"] = pipeline.video_decoder.last_decode_noise_scale
+    record["effective_cas"] = {
+        "amount": float(settings.get("cas_amount", _CAS_AMOUNT_DEFAULT)),
+        "mix": float(settings.get("cas_mix", _CAS_MIX_DEFAULT)),
+    }
     decoded_video = _maybe_cas(decoded_video, settings)  # default-on crispness pass, before encode
     record["vram_after"]["video_vae_decode"] = peak_vram_gib()
 

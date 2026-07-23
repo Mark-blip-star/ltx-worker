@@ -101,28 +101,27 @@ import runpod  # noqa: E402
 from huggingface_hub import snapshot_download  # noqa: E402
 from safetensors import safe_open  # noqa: E402
 import stage_timing_runner as base  # noqa: E402
+from request_config import (  # noqa: E402
+    resolve_boolean,
+    resolve_decode_noise,
+    resolve_negative_prompt,
+    resolve_optional_number,
+)
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps  # noqa: E402
 from ltx_core.loader.registry import StateDictRegistry  # noqa: E402
 from ltx_core.quantization import QuantizationPolicy  # noqa: E402
 from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline  # noqa: E402
 from ltx_pipelines.utils.blocks import PromptEncoder  # noqa: E402
-from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES  # noqa: E402
+from ltx_pipelines.utils.constants import DEFAULT_NEGATIVE_PROMPT, DISTILLED_SIGMA_VALUES  # noqa: E402
 
 # v8.10 F1 (NATIVE-QUALITY-PLAN root-cause fix): gradient-estimating Euler on stage1.
 # 2nd-order AB2 velocity correction reuses the cached previous-step velocity (NO extra
 # transformer call => 0 wall-time) to stop 1st-order Euler from chording the curved motion
 # band — the root of the snap (frozen->ramp on fountain/mage) + fast-motion blur (samurai).
-# Rebinds the module-default loop in blocks; stage2 is provably inert under GE (2 steps:
-# step0 has no previous_velocity => plain Euler; step1 early-returns at sigma==0). So this
-# is effectively stage1-only. Default OFF (LTX_STAGE1_GE unset) => bit-identical to v8.9.
-import ltx_pipelines.utils.blocks as _ltx_blocks  # noqa: E402
-from ltx_pipelines.utils.samplers import (  # noqa: E402
-    euler_denoising_loop as _EULER_LOOP,
-    gradient_estimating_euler_denoising_loop as _GE_LOOP,
-)
-# default loop from env (LTX_STAGE1_GE=1 => GE default); per-request "stage1_ge" overrides below.
+# The selected loop is passed to stage 1 explicitly. Stage 2 always receives the
+# stock Euler loop, avoiding the old process-global blocks-module monkeypatch.
+# The endpoint env remains the default; per-request "stage1_ge" can override it.
 _STAGE1_GE_DEFAULT = os.environ.get("LTX_STAGE1_GE") == "1"
-_DECODE_NOISE_ENV = os.environ.get("LTX_DECODE_NOISE_SCALE") is not None  # preserve env default across requests
 _CFG_CACHE_ENV = os.environ.get("LTX_CFG_CACHE") == "1"  # same: an endpoint-level LTX_CFG_CACHE=1 must
 # survive requests that omit the per-request "cfg_cache" flag (else the per-request block below would
 # pop it on every such request and the env default never engages — the v8.13 30s-instead-of-Q5 bug).
@@ -204,6 +203,7 @@ _FACE = {"app": None, "swapper": None}
 #   pixel chunks before H264 encode in stage_timing_runner (~+0.6s). Tunable; request {"cas_amount":0}
 #   disables for A/B. Defaults live in stage_timing_runner (_CAS_AMOUNT_DEFAULT / _CAS_MIX_DEFAULT).
 CAS_AMOUNT_DEFAULT = float(os.environ.get("LTX_CAS_AMOUNT", "0.6"))
+CAS_MIX_DEFAULT = float(os.environ.get("LTX_CAS_MIX", "0.7"))
 CONFIG_TAG = (os.environ.get("LTX_CONFIG_TAG", "v8")
               + (f"-s1_{S1_LORA_STRENGTH:g}" if S1_LORA_STRENGTH > 0 else "")
               + (f"-xlora{EXTRA_LORA_S1:g}_{EXTRA_LORA_S2:g}" if EXTRA_LORA_REPO else "")
@@ -680,7 +680,8 @@ def _warmup_generation():
     case = {"id": "warmup", "file": "warmup", "prompt": DEFAULT_PROMPT, "seed": 3102}
     settings = {"width": 1280, "height": 704, "frames": 121, "fps": 24.0,
                 "conditioning_strength": 0.8, "conditioning_crf": 0,
-                "dev_inference_steps": FAST_DEFAULT_STEPS}
+                "dev_inference_steps": FAST_DEFAULT_STEPS,
+                "stage1_ge": _STAGE1_GE_DEFAULT}
     t0 = _t.time()
     rec = base.run_case(_PIPE, case, settings, _tier_args("fast", "warmup"),
                         repeat_idx=1, prompt_cache=None, resident_stage_cache=_STAGE_CACHE)
@@ -1146,6 +1147,63 @@ def _mux_ref_audio(video_bytes: bytes, ref_path, duration_s: float) -> bytes:
     return buf.getvalue()
 
 
+def _effective_cfg_cache() -> dict:
+    """Describe the values the denoiser will read for this request."""
+    interval_raw = os.environ.get("LTX_CFG_CACHE_INTERVAL", "2")
+    warmup_raw = os.environ.get("LTX_CFG_CACHE_WARMUP", "2")
+    try:
+        interval = int(interval_raw)
+        interval_valid = True
+    except (TypeError, ValueError):
+        interval = None
+        interval_valid = False
+    try:
+        warmup = int(warmup_raw)
+        warmup_valid = True
+    except (TypeError, ValueError):
+        warmup = None
+        warmup_valid = False
+    range_raw = os.environ.get("LTX_CFG_CACHE_RANGE") or None
+    range_effective = None
+    range_valid = True
+    if range_raw:
+        try:
+            lo, hi = (int(x) for x in range_raw.split(":"))
+            range_effective = {"start": lo, "end_exclusive": hi}
+        except (TypeError, ValueError):
+            # denoisers.py also treats an unparsable range as no window.
+            range_valid = False
+    return {
+        "enabled": os.environ.get("LTX_CFG_CACHE") == "1",
+        "interval": interval,
+        "interval_valid": interval_valid,
+        "configured_interval": interval_raw,
+        "warmup_steps": warmup,
+        "warmup_valid": warmup_valid,
+        "configured_warmup": warmup_raw,
+        "range": range_effective,
+        "range_valid": range_valid,
+        "configured_range": range_raw,
+    }
+
+
+def _effective_tgate() -> dict:
+    start_raw = os.environ.get("LTX_TGATE_START_STEP")
+    try:
+        start_step = int(start_raw) if start_raw is not None else None
+        valid = True
+    except (TypeError, ValueError):
+        start_step = None
+        valid = False
+    return {
+        "configured": start_raw is not None,
+        "enabled": start_step is not None,
+        "start_step": start_step,
+        "configured_start_step": start_raw,
+        "valid": valid,
+    }
+
+
 def handler(job):
     global _FIRST_JOB_SEEN
     if not _FIRST_JOB_SEEN:
@@ -1176,7 +1234,27 @@ def handler(job):
         tier = str(inp.get("tier", os.environ.get("LTX_DEFAULT_TIER", "fast"))).lower()
         if tier not in ("fast", "quality"):
             tier = "fast"
-        audio_on = bool(inp.get("audio", False))  # H-3 (owner-approved 2026-06-11): audio off by default, −3.3s
+        try:
+            negative_prompt, negative_prompt_source = resolve_negative_prompt(
+                inp, DEFAULT_NEGATIVE_PROMPT
+            )
+            decode_noise = resolve_decode_noise(inp)
+            ge_on = resolve_boolean(inp, "stage1_ge", _STAGE1_GE_DEFAULT)
+            audio_on = resolve_boolean(inp, "audio", False)
+            enhance_requested = resolve_boolean(inp, "enhance", ENHANCE_DEFAULT)
+            cfg_cache_on = resolve_boolean(inp, "cfg_cache", _CFG_CACHE_ENV)
+            cas_amount = resolve_optional_number(
+                inp, "cas_amount", minimum=0.0, maximum=1.0
+            )
+            cas_mix = resolve_optional_number(
+                inp, "cas_mix", minimum=0.0, maximum=1.0
+            )
+        except ValueError as exc:
+            return {
+                "error": "invalid_request",
+                "detail": str(exc),
+                "config_tag": f"{CONFIG_TAG}-{tier}",
+            }
         steps = int(inp.get("steps", FAST_DEFAULT_STEPS if tier == "fast" else 16))
         sig = inp.get("sigmas")  # explicit stage1 grid, fast tier only (sigma-sweep lever)
         if sig is None and tier == "fast" and FAST_SIGMAS_DEFAULT is not None:
@@ -1246,8 +1324,14 @@ def handler(job):
         if not t2v:
             with open(img_path, "wb") as f:
                 f.write(base64.b64decode(inp["image_b64"]))
-        case = {"id": "req", "file": "req", "prompt": inp.get("prompt") or DEFAULT_PROMPT,
-                "seed": int(inp.get("seed", 3102))}
+        case = {
+            "id": "req",
+            "file": "req",
+            "prompt": inp.get("prompt") or DEFAULT_PROMPT,
+            "negative_prompt": negative_prompt,
+            "negative_prompt_source": negative_prompt_source,
+            "seed": int(inp.get("seed", 3102)),
+        }
         raw_prompt = case["prompt"]
         enhanced_prompt = None
         # Prompt upsampler is the ALWAYS-ON product default (env LTX_ENHANCE=1 => ENHANCE_DEFAULT=True;
@@ -1256,8 +1340,8 @@ def handler(job):
         # prompt across arms, impossible while Gemma samples non-deterministically — so tests bypass it and
         # feed a fixed pre-enhanced prompt. Not exposed in the product UI; default stays on.
         enhance_seconds = None  # Phase-0 instrumentation: the ~6-8s upsampler was never measured per-call
-        if (bool(inp.get("enhance", ENHANCE_DEFAULT)) and ENHANCE_VISION
-                and (ENHANCE_T2V or not t2v)):  # t2v rewrite is text-only (v8.18); i2v stays vision-based
+        enhance_eligible = ENHANCE_VISION and (ENHANCE_T2V or not t2v)
+        if enhance_requested and enhance_eligible:  # t2v rewrite text-only; i2v stays vision-based
             try:
                 _t_enh = time.time()
                 if t2v:
@@ -1279,10 +1363,12 @@ def handler(job):
             "t2v": t2v,  # v8.17: text-to-video (no conditioning image)
         }
         # CAS crispness pass (default-on). Per-request override for A/B; omit in prod => env/default.
-        if "cas_amount" in inp:
-            settings["cas_amount"] = float(inp["cas_amount"])
-        if "cas_mix" in inp:
-            settings["cas_mix"] = float(inp["cas_mix"])
+        if cas_amount is not None:
+            settings["cas_amount"] = cas_amount
+        if cas_mix is not None:
+            settings["cas_mix"] = cas_mix
+        if decode_noise is not None:
+            settings["decode_noise"] = decode_noise
         pose_seconds = None
         if meme_mode:
             # v8.21: output orientation must follow the REFERENCE video (the pose canvas), not
@@ -1332,10 +1418,8 @@ def handler(job):
         # per-request config switches (handler is single-threaded)
         _SIGMA_MODE["mode"] = "distilled" if tier == "fast" else "ltx2"
         _SIGMA_MODE["override"] = sig if tier == "fast" else None
-        _SKIP_NEG_NOW["on"] = SKIP_NEG_ENCODE and tier == "fast" and not audio_on
         # F1 (NATIVE-QUALITY): gradient-estimating Euler on stage1 — per-request, 0 wall-time.
-        ge_on = bool(inp.get("stage1_ge", _STAGE1_GE_DEFAULT))
-        _ltx_blocks.euler_denoising_loop = _GE_LOOP if ge_on else _EULER_LOOP
+        settings["stage1_ge"] = ge_on
         # F2: per-request stage2 sigmas (re-noise/refine grid); else env/default _STAGE2_FAST.
         _stage2 = _STAGE2_FAST
         if tier == "fast" and "stage2_sigmas" in inp:
@@ -1343,11 +1427,6 @@ def handler(job):
             if len(v2) >= 2 and abs(v2[-1]) < 1e-9 and all(v2[i] > v2[i + 1] for i in range(len(v2) - 1)):
                 _stage2 = torch.tensor(v2)
         base.STAGE_2_DISTILLED_SIGMAS = _stage2 if tier == "fast" else _STAGE2_DEFAULT
-        # F4: per-request decode renoise grain (single-threaded => env round-trip is safe).
-        if "decode_noise" in inp:
-            os.environ["LTX_DECODE_NOISE_SCALE"] = str(float(inp["decode_noise"]))
-        elif not _DECODE_NOISE_ENV:
-            os.environ.pop("LTX_DECODE_NOISE_SCALE", None)
         # v8.15: per-request Detail-Daemon (sampler hook reads LTX_DETAIL_DAEMON*); restore env default
         # when omitted so it never leaks across requests. Prod (no flag, no env) => off => bit-exact.
         if "detail_daemon" in inp:
@@ -1373,9 +1452,23 @@ def handler(job):
             targs.video_cfg_scale = float(inp["cfg"]); guided = float(inp["cfg"]) > 1.0
         if "modality" in inp:
             targs.video_modality_scale = float(inp["modality"])
-        if inp.get("cfg_cache"):
+        # The negative context may only be elided when CFG is actually 1. A
+        # per-request cfg>1 must encode the caller's negative prompt.
+        effective_video_cfg = (
+            float(targs.video_cfg_scale)
+            if targs.video_cfg_scale is not None
+            else float(LTX_2_3_PARAMS.video_guider_params.cfg_scale)
+        )
+        _SKIP_NEG_NOW["on"] = (
+            SKIP_NEG_ENCODE
+            and tier == "fast"
+            and not audio_on
+            and effective_video_cfg == 1.0
+            and negative_prompt_source == "default"
+        )
+        if cfg_cache_on:
             os.environ["LTX_CFG_CACHE"] = "1"
-        elif not _CFG_CACHE_ENV:
+        else:
             os.environ.pop("LTX_CFG_CACHE", None)
         # per-request cache tuning (interval/warmup/range) for A/B; restore endpoint env default when
         # a request omits one so tuning never leaks across requests (handler is single-threaded).
@@ -1389,6 +1482,8 @@ def handler(job):
             else:
                 os.environ.pop(_k, None)
 
+        cfg_cache_effective = _effective_cfg_cache()
+        tgate_effective = _effective_tgate()
         rec = base.run_case(_PIPE, case, settings, targs,
                             repeat_idx=1, prompt_cache=None, resident_stage_cache=_STAGE_CACHE)
         if rec.get("error"):
@@ -1413,6 +1508,10 @@ def handler(job):
                 mux_status = "source_audio_muxed"
             except Exception as exc:  # noqa: BLE001 — video without audio beats a failed job
                 mux_status = f"mux_failed: {str(exc)[:120]}"
+        cas_effective = rec.get("effective_cas") or {
+            "amount": float(settings.get("cas_amount", CAS_AMOUNT_DEFAULT)),
+            "mix": float(settings.get("cas_mix", CAS_MIX_DEFAULT)),
+        }
         resp = {
             "peak_vram_gib": rec.get("peak_vram_gib"),
             "elapsed_seconds": rec.get("elapsed_seconds"),
@@ -1426,6 +1525,43 @@ def handler(job):
                            + (f"-mod{inp['modality']}" if "modality" in inp else "")
                            + (f"-dd{inp['detail_daemon']}" if "detail_daemon" in inp else "")),
             "tier": tier,
+            "effective_config": {
+                "sampler": {
+                    "stage1": "gradient_estimating_euler" if ge_on else "euler",
+                    "stage1_ge": ge_on,
+                    "stage2": "euler",
+                },
+                "cfg_cache": cfg_cache_effective,
+                "tgate": tgate_effective,
+                "cas": {
+                    **cas_effective,
+                    "enabled": float(cas_effective["amount"]) > 0.0,
+                },
+                "decode_noise": {
+                    "scale": rec.get("effective_decode_noise_scale"),
+                    "source": "request" if decode_noise is not None else "decoder_default",
+                },
+                "enhance": {
+                    "requested": enhance_requested,
+                    "eligible": enhance_eligible,
+                    "applied": enhanced_prompt is not None,
+                },
+                "audio": {"enabled": audio_on},
+                "tier": tier,
+                "shape": {
+                    "width": settings["width"],
+                    "height": settings["height"],
+                    "frames": settings["frames"],
+                    "fps": settings["fps"],
+                },
+                "negative_prompt": {
+                    "source": negative_prompt_source,
+                    "characters": len(negative_prompt),
+                    "encoded": not _SKIP_NEG_NOW["on"],
+                    "cfg_scale": effective_video_cfg,
+                    "applied_to_guidance": effective_video_cfg != 1.0,
+                },
+            },
         }
         if meme_mode:
             resp["pose_seconds"] = pose_seconds
