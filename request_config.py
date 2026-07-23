@@ -157,6 +157,66 @@ def conditioning_strength_tag_suffix(value: float | None) -> str:
     return f"-ic{safe}"
 
 
+def resolve_stage_conditioning_strengths(
+    payload: Mapping[str, Any],
+) -> tuple[float, float] | None:
+    """Validate an explicit stage-1/stage-2 image-conditioning pair.
+
+    This experimental lever is deliberately all-or-nothing. Requiring both
+    fields prevents a caller from unknowingly combining one request value with
+    a mutable worker default. The legacy ``conditioning_strength`` remains the
+    compatible equal-strength path, but it cannot be mixed with the stage
+    pair because that would make the effective request ambiguous.
+    """
+    stage1_key = "conditioning_strength_stage1"
+    stage2_key = "conditioning_strength_stage2"
+    has_stage1 = stage1_key in payload
+    has_stage2 = stage2_key in payload
+    if has_stage1 != has_stage2:
+        raise ValueError(
+            f"{stage1_key} and {stage2_key} must be provided together"
+        )
+    if not has_stage1:
+        return None
+    if "conditioning_strength" in payload:
+        raise ValueError(
+            "conditioning_strength cannot be combined with stage-specific "
+            "conditioning strengths"
+        )
+    stage1 = resolve_optional_number(
+        payload,
+        stage1_key,
+        minimum=0.0,
+        maximum=1.0,
+    )
+    stage2 = resolve_optional_number(
+        payload,
+        stage2_key,
+        minimum=0.0,
+        maximum=1.0,
+    )
+    assert stage1 is not None and stage2 is not None
+    return stage1, stage2
+
+
+def stage_conditioning_strength_tag_suffix(
+    values: tuple[float, float] | None,
+) -> str:
+    """Return an exact, arm-distinct tag for a stage-specific strength pair."""
+    if values is None:
+        return ""
+
+    def safe(value: float) -> str:
+        return (
+            repr(float(value))
+            .replace(".", "_")
+            .replace("+", "p")
+            .replace("-", "m")
+        )
+
+    return f"-ics1_{safe(values[0])}-s2_{safe(values[1])}"
+
+
 def resolve_negative_prompt(payload: Mapping[str, Any], default: str) -> tuple[str, str]:
     """Return the effective negative prompt and whether it came from the request."""
     if "negative_prompt" not in payload:

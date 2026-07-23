@@ -13,8 +13,10 @@ from request_config import (
     resolve_negative_prompt,
     resolve_optional_number,
     resolve_optional_step_count,
+    resolve_stage_conditioning_strengths,
     resolve_stage2_sigmas,
     sampling_schedule_tag_suffix,
+    stage_conditioning_strength_tag_suffix,
 )
 
 
@@ -154,6 +156,52 @@ class OptionalNumberTests(unittest.TestCase):
             conditioning_strength_tag_suffix(0.8000001),
             conditioning_strength_tag_suffix(0.8),
         )
+
+
+class StageConditioningStrengthTests(unittest.TestCase):
+    def test_omitted_pair_preserves_legacy_path(self) -> None:
+        self.assertIsNone(resolve_stage_conditioning_strengths({}))
+        self.assertEqual(stage_conditioning_strength_tag_suffix(None), "")
+
+    def test_accepts_exact_stage_pair_and_builds_distinct_tag(self) -> None:
+        values = resolve_stage_conditioning_strengths(
+            {
+                "conditioning_strength_stage1": 1.0,
+                "conditioning_strength_stage2": 0.8,
+            }
+        )
+        self.assertEqual(values, (1.0, 0.8))
+        self.assertEqual(
+            stage_conditioning_strength_tag_suffix(values),
+            "-ics1_1_0-s2_0_8",
+        )
+        self.assertNotEqual(
+            stage_conditioning_strength_tag_suffix((1.0, 0.8)),
+            stage_conditioning_strength_tag_suffix((0.8, 1.0)),
+        )
+
+    def test_requires_both_fields_and_forbids_legacy_ambiguity(self) -> None:
+        for payload in (
+            {"conditioning_strength_stage1": 1.0},
+            {"conditioning_strength_stage2": 0.8},
+            {
+                "conditioning_strength": 0.8,
+                "conditioning_strength_stage1": 1.0,
+                "conditioning_strength_stage2": 0.8,
+            },
+        ):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                resolve_stage_conditioning_strengths(payload)
+
+    def test_rejects_invalid_stage_values(self) -> None:
+        for value in (False, "1.0", None, math.nan, math.inf, -0.01, 1.01):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                resolve_stage_conditioning_strengths(
+                    {
+                        "conditioning_strength_stage1": value,
+                        "conditioning_strength_stage2": 0.8,
+                    }
+                )
 
 
 class SamplingScheduleTests(unittest.TestCase):

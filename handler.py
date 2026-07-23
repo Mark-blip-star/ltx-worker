@@ -113,8 +113,10 @@ from request_config import (  # noqa: E402
     resolve_negative_prompt,
     resolve_optional_number,
     resolve_optional_step_count,
+    resolve_stage_conditioning_strengths,
     resolve_stage2_sigmas,
     sampling_schedule_tag_suffix,
+    stage_conditioning_strength_tag_suffix,
 )
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps  # noqa: E402
 from ltx_core.loader.registry import StateDictRegistry  # noqa: E402
@@ -1471,6 +1473,9 @@ def handler(job):
             requested_conditioning_strength = resolve_optional_number(
                 inp, "conditioning_strength", minimum=0.0, maximum=1.0
             )
+            requested_stage_conditioning_strengths = (
+                resolve_stage_conditioning_strengths(inp)
+            )
             requested_stage1_steps = resolve_optional_step_count(inp)
             requested_stage2_sigmas = resolve_stage2_sigmas(inp)
         except ValueError as exc:
@@ -1548,6 +1553,12 @@ def handler(job):
         # Same LTX-2.3 model handles both; t2v just passes empty image-conditionings (combined_image_
         # conditionings(images=[]) -> no conditioning) and skips the vision-enhancer (which needs an image).
         t2v = not inp.get("image_b64")
+        if t2v and requested_stage_conditioning_strengths is not None:
+            return {
+                "error": "invalid_request",
+                "detail": "stage-specific conditioning strengths require image_b64",
+                "config_tag": f"{CONFIG_TAG}-{tier}",
+            }
         img_path = _IN / "req"
         if not t2v:
             with open(img_path, "wb") as f:
@@ -1583,18 +1594,22 @@ def handler(job):
                 case["prompt"] = enhanced_prompt
             except Exception as exc:  # noqa: BLE001 — graceful fallback to raw prompt
                 _INIT_LOG.append(f"enhance failed, raw used: {exc!r}")
-        conditioning_strength = (
-            requested_conditioning_strength
-            if requested_conditioning_strength is not None
-            else 0.8
-        )
-        if t2v:
-            # Text-to-video passes no image conditionings. Keep its telemetry
-            # and runtime tag honest even if a caller supplied an otherwise
-            # valid image-only lever.
-            conditioning_strength_source = "not_applicable"
-            conditioning_strength_tag = ""
+        if requested_stage_conditioning_strengths is not None:
+            conditioning_strength_stage1, conditioning_strength_stage2 = (
+                requested_stage_conditioning_strengths
+            )
+            conditioning_strength_source = "request_stage_pair"
+            conditioning_strength_tag = stage_conditioning_strength_tag_suffix(
+                requested_stage_conditioning_strengths
+            )
         else:
+            conditioning_strength = (
+                requested_conditioning_strength
+                if requested_conditioning_strength is not None
+                else 0.8
+            )
+            conditioning_strength_stage1 = conditioning_strength
+            conditioning_strength_stage2 = conditioning_strength
             conditioning_strength_source = (
                 "request"
                 if requested_conditioning_strength is not None
@@ -1603,10 +1618,21 @@ def handler(job):
             conditioning_strength_tag = conditioning_strength_tag_suffix(
                 requested_conditioning_strength
             )
+        if t2v:
+            # Text-to-video passes no image conditionings. Keep its telemetry
+            # and runtime tag honest even if a caller supplied an otherwise
+            # valid image-only lever.
+            conditioning_strength_source = "not_applicable"
+            conditioning_strength_tag = ""
         settings = {
             "width": int(inp.get("width", 1280)), "height": int(inp.get("height", 704)),
             "frames": int(inp.get("frames", 121)), "fps": float(inp.get("fps", 24.0)),
-            "conditioning_strength": conditioning_strength,  # v8.16 per-request:
+            # Legacy equal-strength field remains for warmup/backward
+            # compatibility. The stage fields are the exact values consumed
+            # by stage_timing_runner.
+            "conditioning_strength": conditioning_strength_stage1,
+            "conditioning_strength_stage1": conditioning_strength_stage1,
+            "conditioning_strength_stage2": conditioning_strength_stage2,
             "conditioning_crf": 0, "dev_inference_steps": steps,  # lower => subject freer to move (un-freeze)
             "t2v": t2v,  # v8.17: text-to-video (no conditioning image)
         }
@@ -1641,9 +1667,15 @@ def handler(job):
             audio_on = False  # LTX audio off; the meme's own soundtrack is muxed back post-encode
             # Identity anchor: the character image must survive 5-10s of pose-driven motion.
             # Measured on pair A seed 42: 0.8 (i2v default) lost the sunglasses, 0.95 kept them.
-            if "conditioning_strength" not in inp:
+            if (
+                requested_conditioning_strength is None
+                and requested_stage_conditioning_strengths is None
+            ):
                 settings["conditioning_strength"] = 0.95
-                conditioning_strength = 0.95
+                settings["conditioning_strength_stage1"] = 0.95
+                settings["conditioning_strength_stage2"] = 0.95
+                conditioning_strength_stage1 = 0.95
+                conditioning_strength_stage2 = 0.95
                 conditioning_strength_source = "meme_default"
             _t_pose = time.time()
             pose_path, retarget_mode = _pose_control_video(
@@ -1855,7 +1887,19 @@ def handler(job):
                 },
                 "image_conditioning": {
                     "enabled": not t2v,
-                    "strength": None if t2v else conditioning_strength,
+                    "strength": (
+                        None
+                        if t2v
+                        or conditioning_strength_stage1
+                        != conditioning_strength_stage2
+                        else conditioning_strength_stage1
+                    ),
+                    "stage1_strength": (
+                        None if t2v else conditioning_strength_stage1
+                    ),
+                    "stage2_strength": (
+                        None if t2v else conditioning_strength_stage2
+                    ),
                     "source": conditioning_strength_source,
                     "frame_index": None if t2v else 0,
                 },

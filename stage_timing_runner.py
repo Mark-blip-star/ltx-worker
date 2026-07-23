@@ -1312,13 +1312,32 @@ def run_case(
     noiser = GaussianNoiser(generator=generator)
     dtype = torch.bfloat16
     t2v = bool(settings.get("t2v"))  # v8.17: text-to-video => no conditioning image
-    image = None if t2v else ImageConditioningInput(
+    stage1_conditioning_strength = float(
+        settings.get(
+            "conditioning_strength_stage1",
+            settings["conditioning_strength"],
+        )
+    )
+    stage2_conditioning_strength = float(
+        settings.get(
+            "conditioning_strength_stage2",
+            settings["conditioning_strength"],
+        )
+    )
+    stage1_image = None if t2v else ImageConditioningInput(
         path=str(args.inputs_dir / case["file"]),
         frame_idx=0,
-        strength=settings["conditioning_strength"],
+        strength=stage1_conditioning_strength,
         crf=settings["conditioning_crf"],
     )
-    _imgs = [] if t2v else [image]  # empty => combined_image_conditionings returns [] => pure t2v
+    stage2_image = None if t2v else ImageConditioningInput(
+        path=str(args.inputs_dir / case["file"]),
+        frame_idx=0,
+        strength=stage2_conditioning_strength,
+        crf=settings["conditioning_crf"],
+    )
+    stage1_images = [] if t2v else [stage1_image]
+    stage2_images = [] if t2v else [stage2_image]
     tiling_config = None if args.no_tiling else TilingConfig.default()
     chunks = get_video_chunks_number(settings["frames"], tiling_config or TilingConfig.default())
 
@@ -1327,7 +1346,7 @@ def run_case(
         return pipeline.prompt_encoder(
             [case["prompt"], negative_prompt],
             enhance_first_prompt=False,
-            enhance_prompt_image=(None if t2v else image.path),
+            enhance_prompt_image=(None if t2v else stage1_image.path),
             enhance_prompt_seed=case["seed"],
         )
 
@@ -1340,7 +1359,7 @@ def run_case(
             prompt_key = prompt_cache.key(
                 prompt=case["prompt"],
                 negative_prompt=negative_prompt,
-                image_path=(Path(image.path) if image else None),
+                image_path=(Path(stage1_image.path) if stage1_image else None),
                 seed=case["seed"],
                 gemma_root=args.gemma_root,
                 gemma_8bit=args.gemma_8bit,
@@ -1371,7 +1390,7 @@ def run_case(
 
     def _stage_1_conditionings(enc):
         conds = combined_image_conditionings(
-            images=_imgs,
+            images=stage1_images,
             height=stage_1_output_shape.height,
             width=stage_1_output_shape.width,
             video_encoder=enc,
@@ -1523,7 +1542,7 @@ def run_case(
     with timed(timers, "stage2_image_conditioner"):
         stage_2_conditionings = pipeline.image_conditioner(
             lambda enc: combined_image_conditionings(
-                images=_imgs,
+                images=stage2_images,
                 height=settings["height"],
                 width=settings["width"],
                 video_encoder=enc,

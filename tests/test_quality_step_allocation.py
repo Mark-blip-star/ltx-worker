@@ -86,13 +86,14 @@ class QualityStepAllocationWiringTests(unittest.TestCase):
             self.handler,
         )
         self.assertIn(
-            '"strength": None if t2v else conditioning_strength',
+            '"stage1_strength"',
             self.handler,
         )
         self.assertIn(
-            '"source": conditioning_strength_source',
+            '"stage2_strength"',
             self.handler,
         )
+        self.assertIn('"source": conditioning_strength_source', self.handler)
         self.assertIn(
             'conditioning_strength_source = "not_applicable"',
             self.handler,
@@ -105,6 +106,30 @@ class QualityStepAllocationWiringTests(unittest.TestCase):
             "+ conditioning_strength_tag",
             self.handler,
         )
+
+    def test_stage_specific_image_conditioning_is_request_local(self) -> None:
+        self.assertIn(
+            "requested_stage_conditioning_strengths = (",
+            self.handler,
+        )
+        self.assertIn(
+            '"conditioning_strength_stage1": conditioning_strength_stage1',
+            self.handler,
+        )
+        self.assertIn(
+            '"conditioning_strength_stage2": conditioning_strength_stage2',
+            self.handler,
+        )
+        self.assertIn(
+            'settings.get(\n            "conditioning_strength_stage1"',
+            self.runner,
+        )
+        self.assertIn(
+            'settings.get(\n            "conditioning_strength_stage2"',
+            self.runner,
+        )
+        self.assertIn("images=stage1_images", self.runner)
+        self.assertIn("images=stage2_images", self.runner)
 
     def test_warmup_receives_fast_schedule_without_global_state(self) -> None:
         self.assertIn('"stage2_sigmas": _STAGE2_FAST', self.handler)
