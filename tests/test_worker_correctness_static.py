@@ -68,6 +68,17 @@ class StageLoopScopingTests(unittest.TestCase):
         )
         self.assertIn('settings["stage1_ge"] = ge_on', source)
 
+    def test_handler_imports_ltx_23_params_used_for_effective_cfg(self) -> None:
+        tree = ast.parse((ROOT / "handler.py").read_text())
+        imported_names = {
+            alias.asname or alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "ltx_pipelines.utils.constants"
+            for alias in node.names
+        }
+        self.assertIn("LTX_2_3_PARAMS", imported_names)
+
     def test_warmup_uses_endpoint_stage1_sampler_default(self) -> None:
         source = (ROOT / "handler.py").read_text()
         self.assertIn('"stage1_ge": _STAGE1_GE_DEFAULT', source)
@@ -137,6 +148,7 @@ class PromptAndDecoderWiringTests(unittest.TestCase):
         self.assertIn("import request_config, stage_timing_runner", source)
         self.assertIn("python -m py_compile", source)
         self.assertIn("/app/request_config.py /app/stage_timing_runner.py /app/handler.py", source)
+        self.assertIn("ruff check --select F821", source)
 
 
 if __name__ == "__main__":

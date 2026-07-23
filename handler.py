@@ -112,7 +112,11 @@ from ltx_core.loader.registry import StateDictRegistry  # noqa: E402
 from ltx_core.quantization import QuantizationPolicy  # noqa: E402
 from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline  # noqa: E402
 from ltx_pipelines.utils.blocks import PromptEncoder  # noqa: E402
-from ltx_pipelines.utils.constants import DEFAULT_NEGATIVE_PROMPT, DISTILLED_SIGMA_VALUES  # noqa: E402
+from ltx_pipelines.utils.constants import (  # noqa: E402
+    DEFAULT_NEGATIVE_PROMPT,
+    DISTILLED_SIGMA_VALUES,
+    LTX_2_3_PARAMS,
+)
 
 # v8.10 F1 (NATIVE-QUALITY-PLAN root-cause fix): gradient-estimating Euler on stage1.
 # 2nd-order AB2 velocity correction reuses the cached previous-step velocity (NO extra

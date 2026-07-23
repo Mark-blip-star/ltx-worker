@@ -58,6 +58,8 @@ COPY dwpose_vendor /app/dwpose_vendor
 # Import smoke-test (CPU-only; catches missing .so + that handler's run_case path imports cleanly)
 RUN cd /app && /app/LTX-2/.venv/bin/python -c "import torch, numpy, PIL, av, OpenImageIO; import ltx_core.loader; import ltx_pipelines.ti2vid_two_stages, ltx_pipelines.iclora_utils; import request_config, stage_timing_runner; import dwpose_vendor; from insightface.app import FaceAnalysis; import ctypes; ctypes.CDLL('libcudnn.so.9'); print('IMPORT SMOKE OK', torch.__version__)" && \
     /app/LTX-2/.venv/bin/python -m py_compile \
+      /app/request_config.py /app/stage_timing_runner.py /app/handler.py && \
+    cd /app/LTX-2 && /app/LTX-2/.venv/bin/ruff check --select F821 \
       /app/request_config.py /app/stage_timing_runner.py /app/handler.py
 
 # I-3: precompile bytecode so cold boots skip py-compile + stat/hash checks

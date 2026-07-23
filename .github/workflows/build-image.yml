@@ -31,6 +31,9 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      - name: Run worker regression tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+
       # The ghcr package predates this workflow (created by PAT pushes from build droplets), so
       # the repo-scoped GITHUB_TOKEN gets `permission_denied: write_package`. GHCR_PAT is the same
       # PAT the droplet builds use (write:packages).
