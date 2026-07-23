@@ -1,6 +1,6 @@
-name: build-worker-image-rd7-stage-ic
+name: build-worker-image-rd8-vbvr-pin
 
-# One-shot R&D build for the request-local, two-stage image-conditioning probe.
+# One-shot R&D build for revision-pinned and SHA-verified extra-LoRA loading.
 # The paths filter prevents later benchmark/documentation pushes from rebuilding it.
 on:
   push:
@@ -44,8 +44,8 @@ jobs:
           platforms: linux/amd64
           push: true
           provenance: false
-          tags: ghcr.io/mark-blip-star/ltx-worker-slim:v8.26.0-rd7-stage-ic-gb812e95-b1
-          cache-from: type=registry,ref=ghcr.io/mark-blip-star/ltx-worker-slim:v8.25.2-rd6-strength-gb063c4f-b1
+          tags: ghcr.io/mark-blip-star/ltx-worker-slim:v8.27.0-rd8-vbvr-pin-gff7c03a-b1
+          cache-from: type=registry,ref=ghcr.io/mark-blip-star/ltx-worker-slim:v8.26.0-rd7-stage-ic-gb812e95-b1
           cache-to: type=inline
 
       - name: Verify pushed manifest
@@ -53,7 +53,7 @@ jobs:
         run: |
           set -euo pipefail
           docker buildx imagetools inspect \
-            ghcr.io/mark-blip-star/ltx-worker-slim:v8.26.0-rd7-stage-ic-gb812e95-b1 \
+            ghcr.io/mark-blip-star/ltx-worker-slim:v8.27.0-rd8-vbvr-pin-gff7c03a-b1 \
             > "${RUNNER_TEMP}/pushed-image-inspect.txt"
           head -5 "${RUNNER_TEMP}/pushed-image-inspect.txt"
           echo "PUSH_VERIFIED"
