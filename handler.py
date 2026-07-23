@@ -107,6 +107,7 @@ from huggingface_hub import snapshot_download  # noqa: E402
 from safetensors import safe_open  # noqa: E402
 import stage_timing_runner as base  # noqa: E402
 from request_config import (  # noqa: E402
+    conditioning_strength_tag_suffix,
     resolve_boolean,
     resolve_decode_noise,
     resolve_negative_prompt,
@@ -1587,11 +1588,21 @@ def handler(job):
             if requested_conditioning_strength is not None
             else 0.8
         )
-        conditioning_strength_source = (
-            "request"
-            if requested_conditioning_strength is not None
-            else "worker_default"
-        )
+        if t2v:
+            # Text-to-video passes no image conditionings. Keep its telemetry
+            # and runtime tag honest even if a caller supplied an otherwise
+            # valid image-only lever.
+            conditioning_strength_source = "not_applicable"
+            conditioning_strength_tag = ""
+        else:
+            conditioning_strength_source = (
+                "request"
+                if requested_conditioning_strength is not None
+                else "worker_default"
+            )
+            conditioning_strength_tag = conditioning_strength_tag_suffix(
+                requested_conditioning_strength
+            )
         settings = {
             "width": int(inp.get("width", 1280)), "height": int(inp.get("height", 704)),
             "frames": int(inp.get("frames", 121)), "fps": float(inp.get("fps", 24.0)),
@@ -1787,6 +1798,7 @@ def handler(job):
                            + ("" if audio_on else "-noaudio")
                            + (f"-sig{steps}" if sig else "") + ("-enh" if enhanced_prompt else "")
                            + ("-ge" if ge_on else "") + schedule_tag_suffix
+                           + conditioning_strength_tag
                            + (f"-dn{inp['decode_noise']}" if "decode_noise" in inp else "")
                            + (f"-cfg{inp['cfg']}" if "cfg" in inp else "") + ("-cfgcache" if inp.get("cfg_cache") else "")
                            + (f"-mod{inp['modality']}" if "modality" in inp else "")

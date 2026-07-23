@@ -93,6 +93,18 @@ class QualityStepAllocationWiringTests(unittest.TestCase):
             '"source": conditioning_strength_source',
             self.handler,
         )
+        self.assertIn(
+            'conditioning_strength_source = "not_applicable"',
+            self.handler,
+        )
+        self.assertIn(
+            'if t2v:',
+            self.handler,
+        )
+        self.assertIn(
+            "+ conditioning_strength_tag",
+            self.handler,
+        )
 
     def test_warmup_receives_fast_schedule_without_global_state(self) -> None:
         self.assertIn('"stage2_sigmas": _STAGE2_FAST', self.handler)

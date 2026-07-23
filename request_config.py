@@ -44,7 +44,10 @@ def resolve_optional_number(
     value = payload[key]
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{key} must be a finite number")
-    resolved = float(value)
+    try:
+        resolved = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{key} must be a finite number") from exc
     if not math.isfinite(resolved):
         raise ValueError(f"{key} must be a finite number")
     if not minimum <= resolved <= maximum:
@@ -134,6 +137,24 @@ def sampling_schedule_tag_suffix(
         f"-s2st{len(stage2_sigmas) - 1}"
         f"-s2h{digest}"
     )
+
+
+def conditioning_strength_tag_suffix(value: float | None) -> str:
+    """Return a stable runtime-tag suffix for an explicit conditioning value.
+
+    ``repr(float)`` is Python's shortest round-trippable representation, so
+    values that differ at runtime cannot silently share a friendly rounded
+    tag. The result contains only tag-safe alphanumerics and underscores.
+    """
+    if value is None:
+        return ""
+    canonical = repr(float(value))
+    safe = (
+        canonical.replace(".", "_")
+        .replace("+", "p")
+        .replace("-", "m")
+    )
+    return f"-ic{safe}"
 
 
 def resolve_negative_prompt(payload: Mapping[str, Any], default: str) -> tuple[str, str]:

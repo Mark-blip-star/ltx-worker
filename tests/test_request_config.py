@@ -7,6 +7,7 @@ from request_config import (
     DEFAULT_DECODE_NOISE_SCALE,
     MAX_DECODE_NOISE_SCALE,
     MAX_NEGATIVE_PROMPT_CHARS,
+    conditioning_strength_tag_suffix,
     resolve_boolean,
     resolve_decode_noise,
     resolve_negative_prompt,
@@ -137,6 +138,22 @@ class OptionalNumberTests(unittest.TestCase):
                     minimum=0.0,
                     maximum=1.0,
                 )
+        with self.assertRaisesRegex(ValueError, "must be a finite number"):
+            resolve_optional_number(
+                {"conditioning_strength": 10**10000},
+                "conditioning_strength",
+                minimum=0.0,
+                maximum=1.0,
+            )
+
+    def test_conditioning_strength_runtime_tag_is_exact_and_arm_distinct(self) -> None:
+        self.assertEqual(conditioning_strength_tag_suffix(None), "")
+        self.assertEqual(conditioning_strength_tag_suffix(0.8), "-ic0_8")
+        self.assertEqual(conditioning_strength_tag_suffix(1.0), "-ic1_0")
+        self.assertNotEqual(
+            conditioning_strength_tag_suffix(0.8000001),
+            conditioning_strength_tag_suffix(0.8),
+        )
 
 
 class SamplingScheduleTests(unittest.TestCase):
