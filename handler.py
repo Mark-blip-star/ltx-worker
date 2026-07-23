@@ -111,6 +111,9 @@ from request_config import (  # noqa: E402
     resolve_decode_noise,
     resolve_negative_prompt,
     resolve_optional_number,
+    resolve_optional_step_count,
+    resolve_stage2_sigmas,
+    sampling_schedule_tag_suffix,
 )
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps  # noqa: E402
 from ltx_core.loader.registry import StateDictRegistry  # noqa: E402
@@ -122,6 +125,7 @@ from ltx_pipelines.utils.constants import (  # noqa: E402
     DEFAULT_NEGATIVE_PROMPT,
     DISTILLED_SIGMA_VALUES,
     LTX_2_3_PARAMS,
+    STAGE_2_DISTILLED_SIGMA_VALUES,
 )
 
 # v8.10 F1 (NATIVE-QUALITY-PLAN root-cause fix): gradient-estimating Euler on stage1.
@@ -252,6 +256,17 @@ _REGIONAL_COMPILE_STATE = {
     "runtime": {},
     "stages": {},
 }
+_REGIONAL_COMPILE_TELEMETRY_LOCK = threading.Lock()
+_REGIONAL_COMPILE_REQUEST_SEQUENCE = 0
+_COMPILER_COUNTER_CATEGORIES = (
+    "frames",
+    "stats",
+    "graph_break",
+    "inductor",
+    "aot_autograd",
+)
+_COMPILER_COUNTER_KEYS_PER_CATEGORY = 20
+_COMPILER_COUNTER_KEY_MAX_CHARS = 160
 
 
 def _regional_compile_snapshot() -> dict[str, object]:
@@ -259,21 +274,75 @@ def _regional_compile_snapshot() -> dict[str, object]:
     return json.loads(json.dumps(_REGIONAL_COMPILE_STATE, sort_keys=True))
 
 
-def _compiler_counter_snapshot() -> dict[str, dict[str, int]]:
-    """Collect bounded Dynamo/Inductor counters after the readiness warmup."""
+def _compiler_counter_snapshot(
+    *,
+    fail_closed: bool = False,
+) -> dict[str, dict[str, int]]:
+    """Collect a bounded current view of cumulative Dynamo/Inductor counters."""
     try:
         from torch._dynamo.utils import counters
-    except Exception:  # noqa: BLE001
+        snapshot = {}
+        for category in _COMPILER_COUNTER_CATEGORIES:
+            values = counters.get(category)
+            if not values:
+                continue
+            ranked = sorted(
+                values.items(),
+                key=lambda item: (-int(item[1]), str(item[0])),
+            )[:_COMPILER_COUNTER_KEYS_PER_CATEGORY]
+            snapshot[category] = {
+                str(key)[:_COMPILER_COUNTER_KEY_MAX_CHARS]: int(value)
+                for key, value in ranked
+            }
+        return snapshot
+    except Exception as exc:  # noqa: BLE001
+        if fail_closed:
+            raise RuntimeError(
+                "regional compile counter telemetry is unavailable"
+            ) from exc
         return {}
 
-    snapshot = {}
-    for category in ("frames", "stats", "graph_break", "inductor", "aot_autograd"):
-        values = counters.get(category)
-        if not values:
-            continue
-        ranked = sorted(values.items(), key=lambda item: (-int(item[1]), str(item[0])))[:20]
-        snapshot[category] = {str(key): int(value) for key, value in ranked}
-    return snapshot
+
+def _refresh_regional_compile_generation_snapshot() -> dict[str, object]:
+    """Refresh latest-only compile telemetry and return this response's copy.
+
+    The cumulative Dynamo counters are useful for detecting graph/recompile
+    growth across A→B→A. Only the newest generation is retained globally, so
+    the worker and each response remain bounded regardless of request count.
+    """
+    global _REGIONAL_COMPILE_REQUEST_SEQUENCE
+    if not _REGIONAL_COMPILE_SETTINGS.enabled:
+        raise RuntimeError(
+            "regional compile generation telemetry called while disabled"
+        )
+    if not torch.cuda.is_available():
+        raise RuntimeError("regional compile telemetry requires CUDA")
+    stage_state = _REGIONAL_COMPILE_STATE["stages"].get("stage1")
+    if stage_state is None or stage_state.get("status") != "warmed":
+        raise RuntimeError(
+            "regional compile stage1 is not in the warmed fail-closed state"
+        )
+    compiler_counters = _compiler_counter_snapshot(fail_closed=True)
+    if not compiler_counters:
+        raise RuntimeError("regional compile counters are unexpectedly empty")
+
+    with _REGIONAL_COMPILE_TELEMETRY_LOCK:
+        _REGIONAL_COMPILE_REQUEST_SEQUENCE += 1
+        _REGIONAL_COMPILE_STATE["post_generation"] = {
+            "request_sequence": _REGIONAL_COMPILE_REQUEST_SEQUENCE,
+            "compiler_counters": compiler_counters,
+            "cuda_allocated_gib": round(torch.cuda.memory_allocated() / 2**30, 3),
+            "cuda_reserved_gib": round(torch.cuda.memory_reserved() / 2**30, 3),
+            "cuda_max_allocated_gib": round(
+                torch.cuda.max_memory_allocated() / 2**30,
+                3,
+            ),
+            "cuda_max_reserved_gib": round(
+                torch.cuda.max_memory_reserved() / 2**30,
+                3,
+            ),
+        }
+        return _regional_compile_snapshot()
 
 
 def _compile_resident_stage(cache_key: str, transformer: torch.nn.Module) -> None:
@@ -521,9 +590,11 @@ if _stage2_env is not None:
     if not (len(_vals) >= 2 and abs(_vals[-1]) < 1e-9
             and all(_vals[i] > _vals[i + 1] for i in range(len(_vals) - 1))):
         raise ValueError(f"LTX_STAGE2_SIGMAS must be strictly descending with last==0: {_vals}")
-    _STAGE2_FAST = torch.tensor(_vals)
+    _STAGE2_FAST_VALUES = tuple(_vals)
 else:
-    _STAGE2_FAST = torch.tensor([0.909375, 0.6, 0.0])
+    _STAGE2_FAST_VALUES = (0.909375, 0.6, 0.0)
+_STAGE2_FAST = torch.tensor(_STAGE2_FAST_VALUES)
+_STAGE2_DEFAULT_VALUES = tuple(float(value) for value in STAGE_2_DISTILLED_SIGMA_VALUES)
 # v8.10: augment CONFIG_TAG with the new knobs (defined here, after _STAGE2_FAST; no NameError)
 CONFIG_TAG += ((f"-mpx{_MAX_PIXELS}" if _MAX_PIXELS != 1280 * 704 else "")
                + (f"-mfr{_MAX_FRAMES}" if _MAX_FRAMES != 121 else "")
@@ -797,13 +868,13 @@ def _warmup_generation():
     shutil.copyfile(src, _IN / "warmup")
     _SIGMA_MODE["mode"] = "distilled"
     _SIGMA_MODE["override"] = None
-    base.STAGE_2_DISTILLED_SIGMAS = _STAGE2_FAST
     os.environ["LTX_NO_AUDIO"] = "1"
     _SKIP_NEG_NOW["on"] = SKIP_NEG_ENCODE
     case = {"id": "warmup", "file": "warmup", "prompt": DEFAULT_PROMPT, "seed": 3102}
     settings = {"width": 1280, "height": 704, "frames": 121, "fps": 24.0,
                 "conditioning_strength": 0.8, "conditioning_crf": 0,
                 "dev_inference_steps": FAST_DEFAULT_STEPS,
+                "stage2_sigmas": _STAGE2_FAST,
                 "stage1_ge": _STAGE1_GE_DEFAULT}
     t0 = _t.time()
     rec = base.run_case(_PIPE, case, settings, _tier_args("fast", "warmup"),
@@ -945,7 +1016,9 @@ def _init():
                             raise RuntimeError("stage1 regional compile was not wrapped during mandatory warmup")
                         stage_state["status"] = "warmed"
                         _REGIONAL_COMPILE_STATE["post_warmup"] = {
-                            "compiler_counters": _compiler_counter_snapshot(),
+                            "compiler_counters": _compiler_counter_snapshot(
+                                fail_closed=True
+                            ),
                             "cuda_allocated_gib": round(torch.cuda.memory_allocated() / 2**30, 3),
                             "cuda_reserved_gib": round(torch.cuda.memory_reserved() / 2**30, 3),
                             "cuda_max_allocated_gib": round(torch.cuda.max_memory_allocated() / 2**30, 3),
@@ -1394,13 +1467,19 @@ def handler(job):
             cas_mix = resolve_optional_number(
                 inp, "cas_mix", minimum=0.0, maximum=1.0
             )
+            requested_stage1_steps = resolve_optional_step_count(inp)
+            requested_stage2_sigmas = resolve_stage2_sigmas(inp)
         except ValueError as exc:
             return {
                 "error": "invalid_request",
                 "detail": str(exc),
                 "config_tag": f"{CONFIG_TAG}-{tier}",
             }
-        steps = int(inp.get("steps", FAST_DEFAULT_STEPS if tier == "fast" else 16))
+        steps = (
+            requested_stage1_steps
+            if requested_stage1_steps is not None
+            else (FAST_DEFAULT_STEPS if tier == "fast" else 16)
+        )
         sig = inp.get("sigmas")  # explicit stage1 grid, fast tier only (sigma-sweep lever)
         if sig is None and tier == "fast" and FAST_SIGMAS_DEFAULT is not None:
             sig = list(FAST_SIGMAS_DEFAULT)  # env default (e.g. A13); validated below like per-request
@@ -1565,13 +1644,32 @@ def handler(job):
         _SIGMA_MODE["override"] = sig if tier == "fast" else None
         # F1 (NATIVE-QUALITY): gradient-estimating Euler on stage1 — per-request, 0 wall-time.
         settings["stage1_ge"] = ge_on
-        # F2: per-request stage2 sigmas (re-noise/refine grid); else env/default _STAGE2_FAST.
-        _stage2 = _STAGE2_FAST
-        if tier == "fast" and "stage2_sigmas" in inp:
-            v2 = [float(x) for x in inp["stage2_sigmas"]]
-            if len(v2) >= 2 and abs(v2[-1]) < 1e-9 and all(v2[i] > v2[i + 1] for i in range(len(v2) - 1)):
-                _stage2 = torch.tensor(v2)
-        base.STAGE_2_DISTILLED_SIGMAS = _stage2 if tier == "fast" else _STAGE2_DEFAULT
+        # Request-local stage-2 grid. Both tiers share the same strict parser,
+        # and the runner receives the tensor in ``settings`` rather than via a
+        # mutable module global, so concurrent or failed requests cannot leak a
+        # prior schedule. Omission preserves each tier's existing tensor.
+        if requested_stage2_sigmas is not None:
+            stage2_effective_values = requested_stage2_sigmas
+            stage2_effective_tensor = torch.tensor(
+                stage2_effective_values,
+                dtype=torch.float32,
+            )
+            stage2_source = "request"
+        elif tier == "fast":
+            stage2_effective_values = _STAGE2_FAST_VALUES
+            stage2_effective_tensor = _STAGE2_FAST
+            stage2_source = "fast_default"
+        else:
+            stage2_effective_values = _STAGE2_DEFAULT_VALUES
+            stage2_effective_tensor = _STAGE2_DEFAULT
+            stage2_source = "quality_default"
+        settings["stage2_sigmas"] = stage2_effective_tensor
+        schedule_tag_suffix = (
+            sampling_schedule_tag_suffix(steps, stage2_effective_values)
+            if requested_stage1_steps is not None
+            or requested_stage2_sigmas is not None
+            else ""
+        )
         # v8.15: per-request Detail-Daemon (sampler hook reads LTX_DETAIL_DAEMON*); restore env default
         # when omitted so it never leaks across requests. Prod (no flag, no env) => off => bit-exact.
         if "detail_daemon" in inp:
@@ -1634,6 +1732,15 @@ def handler(job):
         if rec.get("error"):
             return {"error": rec["error"], "init_log": _INIT_LOG, "config_tag": f"{CONFIG_TAG}-{tier}"}
         out = _OUT / rec["output"]
+        regional_compile_response = None
+        if _REGIONAL_COMPILE_SETTINGS.enabled:
+            try:
+                regional_compile_response = (
+                    _refresh_regional_compile_generation_snapshot()
+                )
+            except Exception:
+                out.unlink(missing_ok=True)
+                raise
         with open(out, "rb") as f:
             raw = f.read()
         os.remove(out)
@@ -1664,7 +1771,7 @@ def handler(job):
             "config_tag": (f"{CONFIG_TAG}-{tier}" + ("-meme" if meme_mode else "")
                            + ("" if audio_on else "-noaudio")
                            + (f"-sig{steps}" if sig else "") + ("-enh" if enhanced_prompt else "")
-                           + ("-ge" if ge_on else "") + (f"-s2_{len(_stage2)}" if "stage2_sigmas" in inp else "")
+                           + ("-ge" if ge_on else "") + schedule_tag_suffix
                            + (f"-dn{inp['decode_noise']}" if "decode_noise" in inp else "")
                            + (f"-cfg{inp['cfg']}" if "cfg" in inp else "") + ("-cfgcache" if inp.get("cfg_cache") else "")
                            + (f"-mod{inp['modality']}" if "modality" in inp else "")
@@ -1675,6 +1782,26 @@ def handler(job):
                     "stage1": "gradient_estimating_euler" if ge_on else "euler",
                     "stage1_ge": ge_on,
                     "stage2": "euler",
+                },
+                "schedule": {
+                    "stage1": {
+                        "requested_step_count": requested_stage1_steps,
+                        "effective_step_count": steps,
+                        "explicit_sigma_grid": sig is not None,
+                    },
+                    "stage2": {
+                        "requested_sigmas": (
+                            list(requested_stage2_sigmas)
+                            if requested_stage2_sigmas is not None
+                            else None
+                        ),
+                        "effective_sigmas": list(stage2_effective_values),
+                        "effective_step_count": len(stage2_effective_values) - 1,
+                        "source": stage2_source,
+                    },
+                    "effective_total_transition_count": (
+                        steps + len(stage2_effective_values) - 1
+                    ),
                 },
                 "cfg_cache": cfg_cache_effective,
                 "tgate": tgate_effective,
@@ -1709,7 +1836,11 @@ def handler(job):
             },
         }
         if _REGIONAL_COMPILE_SETTINGS.enabled:
-            resp["effective_config"]["regional_compile"] = _regional_compile_snapshot()
+            if regional_compile_response is None:
+                raise RuntimeError(
+                    "regional compile response telemetry was not refreshed"
+                )
+            resp["effective_config"]["regional_compile"] = regional_compile_response
         if meme_mode:
             resp["pose_seconds"] = pose_seconds
             resp["frames"] = settings["frames"]

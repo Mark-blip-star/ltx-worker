@@ -1533,7 +1533,15 @@ def run_case(
         )
     record["vram_after"]["stage2_image_conditioner"] = peak_vram_gib()
 
-    stage_2_sigmas = STAGE_2_DISTILLED_SIGMAS.to(dtype=torch.float32, device=pipeline.device)
+    # A request may carry an already validated stage-2 schedule. Keep it in
+    # request-local settings instead of mutating this module's imported
+    # constant; omission remains the stock, bit-exact pipeline default.
+    configured_stage_2_sigmas = settings.get("stage2_sigmas")
+    stage_2_sigmas = (
+        STAGE_2_DISTILLED_SIGMAS
+        if configured_stage_2_sigmas is None
+        else configured_stage_2_sigmas
+    ).to(dtype=torch.float32, device=pipeline.device)
     with timed(timers, "stage2_transformer"):
         if trace_file:
             os.environ["LTX_GUIDANCE_TRACE_STAGE"] = "stage2"
