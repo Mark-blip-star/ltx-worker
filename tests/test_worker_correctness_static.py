@@ -219,6 +219,10 @@ class PromptAndDecoderWiringTests(unittest.TestCase):
         self.assertIn("/app/request_config.py /app/stage_timing_runner.py /app/handler.py", source)
         self.assertIn("ruff check --select F821", source)
 
+    def test_slim_image_installs_shared_library_needed_by_import_smoke(self) -> None:
+        source = (ROOT / "Dockerfile.slim").read_text()
+        self.assertIn("libgl1", source)
+
 
 if __name__ == "__main__":
     unittest.main()

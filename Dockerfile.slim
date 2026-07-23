@@ -10,7 +10,7 @@ ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 \
     UV_PYTHON_INSTALL_DIR=/opt/uv-python UV_LINK_MODE=copy
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl ca-certificates g++ libgomp1 && \
+      curl ca-certificates g++ libgomp1 libgl1 && \
     rm -rf /var/lib/apt/lists/*
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
