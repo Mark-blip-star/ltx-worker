@@ -76,6 +76,24 @@ class QualityStepAllocationWiringTests(unittest.TestCase):
             self.handler,
         )
 
+    def test_effective_config_attests_image_conditioning_strength(self) -> None:
+        self.assertIn(
+            '"conditioning_strength", minimum=0.0, maximum=1.0',
+            self.handler,
+        )
+        self.assertIn(
+            '"image_conditioning"',
+            self.handler,
+        )
+        self.assertIn(
+            '"strength": None if t2v else conditioning_strength',
+            self.handler,
+        )
+        self.assertIn(
+            '"source": conditioning_strength_source',
+            self.handler,
+        )
+
     def test_warmup_receives_fast_schedule_without_global_state(self) -> None:
         self.assertIn('"stage2_sigmas": _STAGE2_FAST', self.handler)
 

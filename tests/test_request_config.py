@@ -109,6 +109,35 @@ class OptionalNumberTests(unittest.TestCase):
                     maximum=1.0,
                 )
 
+    def test_conditioning_strength_accepts_only_a_finite_unit_interval(self) -> None:
+        self.assertIsNone(
+            resolve_optional_number(
+                {},
+                "conditioning_strength",
+                minimum=0.0,
+                maximum=1.0,
+            )
+        )
+        for value in (0, 0.8, 0.95, 1.0):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    resolve_optional_number(
+                        {"conditioning_strength": value},
+                        "conditioning_strength",
+                        minimum=0.0,
+                        maximum=1.0,
+                    ),
+                    float(value),
+                )
+        for value in (False, "1.0", None, math.nan, math.inf, -0.01, 1.01):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                resolve_optional_number(
+                    {"conditioning_strength": value},
+                    "conditioning_strength",
+                    minimum=0.0,
+                    maximum=1.0,
+                )
+
 
 class SamplingScheduleTests(unittest.TestCase):
     candidate_stage2 = (

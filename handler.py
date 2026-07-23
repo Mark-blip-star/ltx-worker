@@ -1467,6 +1467,9 @@ def handler(job):
             cas_mix = resolve_optional_number(
                 inp, "cas_mix", minimum=0.0, maximum=1.0
             )
+            requested_conditioning_strength = resolve_optional_number(
+                inp, "conditioning_strength", minimum=0.0, maximum=1.0
+            )
             requested_stage1_steps = resolve_optional_step_count(inp)
             requested_stage2_sigmas = resolve_stage2_sigmas(inp)
         except ValueError as exc:
@@ -1579,10 +1582,20 @@ def handler(job):
                 case["prompt"] = enhanced_prompt
             except Exception as exc:  # noqa: BLE001 — graceful fallback to raw prompt
                 _INIT_LOG.append(f"enhance failed, raw used: {exc!r}")
+        conditioning_strength = (
+            requested_conditioning_strength
+            if requested_conditioning_strength is not None
+            else 0.8
+        )
+        conditioning_strength_source = (
+            "request"
+            if requested_conditioning_strength is not None
+            else "worker_default"
+        )
         settings = {
             "width": int(inp.get("width", 1280)), "height": int(inp.get("height", 704)),
             "frames": int(inp.get("frames", 121)), "fps": float(inp.get("fps", 24.0)),
-            "conditioning_strength": float(inp.get("conditioning_strength", 0.8)),  # v8.16 per-request:
+            "conditioning_strength": conditioning_strength,  # v8.16 per-request:
             "conditioning_crf": 0, "dev_inference_steps": steps,  # lower => subject freer to move (un-freeze)
             "t2v": t2v,  # v8.17: text-to-video (no conditioning image)
         }
@@ -1619,6 +1632,8 @@ def handler(job):
             # Measured on pair A seed 42: 0.8 (i2v default) lost the sunglasses, 0.95 kept them.
             if "conditioning_strength" not in inp:
                 settings["conditioning_strength"] = 0.95
+                conditioning_strength = 0.95
+                conditioning_strength_source = "meme_default"
             _t_pose = time.time()
             pose_path, retarget_mode = _pose_control_video(
                 ref_src, img_path, settings["width"], settings["height"],
@@ -1825,6 +1840,12 @@ def handler(job):
                     "height": settings["height"],
                     "frames": settings["frames"],
                     "fps": settings["fps"],
+                },
+                "image_conditioning": {
+                    "enabled": not t2v,
+                    "strength": None if t2v else conditioning_strength,
+                    "source": conditioning_strength_source,
+                    "frame_index": None if t2v else 0,
                 },
                 "negative_prompt": {
                     "source": negative_prompt_source,
