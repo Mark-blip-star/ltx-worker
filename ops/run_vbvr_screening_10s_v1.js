@@ -6,7 +6,9 @@ const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
-const SPEC_PATH = path.join(__dirname, 'vbvr_screening_10s_v1.json');
+const SPEC_PATH = process.env.LTX_SCREEN_SPEC_PATH
+  ? path.resolve(process.env.LTX_SCREEN_SPEC_PATH)
+  : path.join(__dirname, 'vbvr_screening_10s_v1.json');
 const EXECUTE = process.argv.includes('--execute');
 const POLL_MS = 2_000;
 const JOB_TIMEOUT_MS = 45 * 60_000;
@@ -225,6 +227,10 @@ function assertOutput(output, expectedTag, defaults) {
   const effective = output?.effective_config || {};
   const shape = effective.shape || {};
   const imageConditioning = effective.image_conditioning || {};
+  const terminalKeyframe = effective.terminal_keyframe || {};
+  const expectsTerminalKeyframe =
+    Number(defaults.terminal_keyframe_strength_stage1 || 0) > 0 ||
+    Number(defaults.terminal_keyframe_strength_stage2 || 0) > 0;
   if (
     output?.config_tag !== expectedTag ||
     effective.tier !== 'quality' ||
@@ -249,7 +255,15 @@ function assertOutput(output, expectedTag, defaults) {
     imageConditioning.stage2_strength !== 0.8 ||
     effective.schedule?.stage1?.effective_step_count !== 16 ||
     effective.schedule?.stage2?.effective_step_count !== 3 ||
-    effective.schedule?.effective_total_transition_count !== 19
+    effective.schedule?.effective_total_transition_count !== 19 ||
+    (expectsTerminalKeyframe &&
+      (terminalKeyframe.enabled !== true ||
+        terminalKeyframe.frame_index !== defaults.frames - 1 ||
+        terminalKeyframe.stage1_strength !==
+          Number(defaults.terminal_keyframe_strength_stage1 || 0) ||
+        terminalKeyframe.stage2_strength !==
+          Number(defaults.terminal_keyframe_strength_stage2 || 0) ||
+        terminalKeyframe.source !== 'request'))
   ) {
     fail(
       `Effective runtime attestation failed: ${JSON.stringify(
@@ -262,16 +276,19 @@ function assertOutput(output, expectedTag, defaults) {
 function validateSpec(spec) {
   if (
     spec.schemaVersion !== 1 ||
-    spec.experimentId !== 'vbvr-stage1-screening-10s-v1' ||
+    typeof spec.experimentId !== 'string' ||
+    !spec.experimentId ||
     spec.cases?.length !== 4 ||
     spec.defaults?.frames !== 241 ||
-    spec.defaults?.audio !== true
+    spec.defaults?.audio !== true ||
+    typeof spec.artifactSuffix !== 'string' ||
+    !spec.artifactSuffix
   ) {
-    fail('VBVR screening spec contract is invalid');
+    fail('Four-case 10s screening spec contract is invalid');
   }
 }
 
-function loadFreeze() {
+function loadFreeze(spec) {
   const freezePath = process.env.LTX_VBVR_SCREEN_FREEZE_PATH;
   const expectedSha = process.env.LTX_VBVR_SCREEN_FREEZE_SHA256;
   if (!freezePath || !/^[0-9a-f]{64}$/.test(expectedSha || '')) {
@@ -283,10 +300,11 @@ function loadFreeze() {
   if (
     freeze.schemaVersion !== 1 ||
     freeze.status !== 'FROZEN_FOR_EXECUTION' ||
-    freeze.experimentId !== 'vbvr-stage1-screening-10s-v1' ||
+    freeze.experimentId !== spec.experimentId ||
     !/^[0-9a-f]{64}$/.test(freeze.image?.ociDigestHex || '') ||
-    !/^[0-9a-f]{64}$/.test(freeze.extraLora?.sha256 || '') ||
-    !/^[0-9a-f]{40}$/.test(freeze.extraLora?.revision || '') ||
+    (spec.requireExtraLora === true &&
+      (!/^[0-9a-f]{64}$/.test(freeze.extraLora?.sha256 || '') ||
+        !/^[0-9a-f]{40}$/.test(freeze.extraLora?.revision || ''))) ||
     freeze.endpoint?.workersMin !== 1 ||
     freeze.endpoint?.workersMax !== 1 ||
     freeze.endpoint?.idleTimeout !== 600 ||
@@ -304,7 +322,7 @@ async function execute(spec) {
   if (!apiKey || !outDir || !stillsDir) {
     fail('Execution requires runtime API key, output directory, and stills');
   }
-  const freeze = loadFreeze();
+  const freeze = loadFreeze(spec);
   const endpoint = await api(
     apiKey,
     'GET',
@@ -375,8 +393,8 @@ async function execute(spec) {
     assertOutput(result.output, freeze.expectedConfigTag, spec.defaults);
     const video = decodeCanonicalMp4(extractVideoBase64(result.output));
     const fileName = job.scored
-      ? `${job.caseId}__seed-${job.seed}__vbvr_s1_0_35.mp4`
-      : `__warmup__${job.caseId}__seed-${job.seed}__vbvr_s1_0_35.mp4`;
+      ? `${job.caseId}__seed-${job.seed}__${spec.artifactSuffix}.mp4`
+      : `__warmup__${job.caseId}__seed-${job.seed}__${spec.artifactSuffix}.mp4`;
     const filePath = path.join(outDir, fileName);
     fs.writeFileSync(filePath, video, { mode: 0o600, flag: 'wx' });
     const probe = probeVideo(filePath, spec.defaults);

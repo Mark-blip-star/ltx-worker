@@ -1338,6 +1338,60 @@ def run_case(
     )
     stage1_images = [] if t2v else [stage1_image]
     stage2_images = [] if t2v else [stage2_image]
+    # R&D long-horizon lever: reuse the exact accepted still as a weak terminal
+    # guiding keyframe. Non-zero frame indices use the official
+    # VideoConditionByKeyframeIndex path, so the first-frame replacement remains
+    # unchanged. Defaults are strictly off and therefore preserve the existing
+    # product path bit-for-bit.
+    terminal_frame_index = settings["frames"] - 1
+    terminal_keyframe_strength_stage1 = float(
+        settings.get("terminal_keyframe_strength_stage1", 0.0)
+    )
+    terminal_keyframe_strength_stage2 = float(
+        settings.get("terminal_keyframe_strength_stage2", 0.0)
+    )
+    if not t2v and terminal_keyframe_strength_stage1 > 0.0:
+        stage1_images.append(
+            ImageConditioningInput(
+                path=str(args.inputs_dir / case["file"]),
+                frame_idx=terminal_frame_index,
+                strength=terminal_keyframe_strength_stage1,
+                crf=settings["conditioning_crf"],
+            )
+        )
+    if not t2v and terminal_keyframe_strength_stage2 > 0.0:
+        stage2_images.append(
+            ImageConditioningInput(
+                path=str(args.inputs_dir / case["file"]),
+                frame_idx=terminal_frame_index,
+                strength=terminal_keyframe_strength_stage2,
+                crf=settings["conditioning_crf"],
+            )
+        )
+    record["terminal_keyframe"] = {
+        "enabled": bool(
+            not t2v
+            and (
+                terminal_keyframe_strength_stage1 > 0.0
+                or terminal_keyframe_strength_stage2 > 0.0
+            )
+        ),
+        "frame_index": (
+            terminal_frame_index
+            if not t2v
+            and (
+                terminal_keyframe_strength_stage1 > 0.0
+                or terminal_keyframe_strength_stage2 > 0.0
+            )
+            else None
+        ),
+        "stage1_strength": (
+            terminal_keyframe_strength_stage1 if not t2v else None
+        ),
+        "stage2_strength": (
+            terminal_keyframe_strength_stage2 if not t2v else None
+        ),
+    }
     tiling_config = None if args.no_tiling else TilingConfig.default()
     chunks = get_video_chunks_number(settings["frames"], tiling_config or TilingConfig.default())
 

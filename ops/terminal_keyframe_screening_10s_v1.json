@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "experimentId": "vbvr-stage1-screening-10s-v1",
-  "artifactSuffix": "vbvr_s1_0_35",
-  "requireExtraLora": true,
-  "description": "Four-case matched-seed screen of the pinned VBVR 390K LoRA at stage-1 scale 0.35 against the completed RD7 0.8/0.8 control artifacts.",
+  "experimentId": "terminal-keyframe-stage1-screening-10s-v1",
+  "artifactSuffix": "terminal_keyframe_s1_0_25",
+  "requireExtraLora": false,
+  "description": "Preregistered matched-seed screen of one weak final-frame guiding keyframe at stage 1 only against the completed RD7 0.8/0.8 default-off artifacts.",
   "baselineRunRelativePath": "benchmark/runs/quality-conditioning-stage-factorial-10s-v1-restart1",
   "defaults": {
     "width": 1280,
@@ -18,7 +18,9 @@
     "cfg_cache_range": "4:9",
     "stage1_ge": true,
     "conditioning_strength_stage1": 0.8,
-    "conditioning_strength_stage2": 0.8
+    "conditioning_strength_stage2": 0.8,
+    "terminal_keyframe_strength_stage1": 0.25,
+    "terminal_keyframe_strength_stage2": 0
   },
   "warmup": {
     "caseId": "waterfall",

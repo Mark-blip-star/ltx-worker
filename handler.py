@@ -1502,6 +1502,22 @@ def handler(job):
             requested_stage_conditioning_strengths = (
                 resolve_stage_conditioning_strengths(inp)
             )
+            requested_terminal_keyframe_strength_stage1 = (
+                resolve_optional_number(
+                    inp,
+                    "terminal_keyframe_strength_stage1",
+                    minimum=0.0,
+                    maximum=1.0,
+                )
+            )
+            requested_terminal_keyframe_strength_stage2 = (
+                resolve_optional_number(
+                    inp,
+                    "terminal_keyframe_strength_stage2",
+                    minimum=0.0,
+                    maximum=1.0,
+                )
+            )
             requested_stage1_steps = resolve_optional_step_count(inp)
             requested_stage2_sigmas = resolve_stage2_sigmas(inp)
         except ValueError as exc:
@@ -1585,6 +1601,15 @@ def handler(job):
                 "detail": "stage-specific conditioning strengths require image_b64",
                 "config_tag": f"{CONFIG_TAG}-{tier}",
             }
+        if t2v and (
+            requested_terminal_keyframe_strength_stage1 is not None
+            or requested_terminal_keyframe_strength_stage2 is not None
+        ):
+            return {
+                "error": "invalid_request",
+                "detail": "terminal keyframe strengths require image_b64",
+                "config_tag": f"{CONFIG_TAG}-{tier}",
+            }
         img_path = _IN / "req"
         if not t2v:
             with open(img_path, "wb") as f:
@@ -1661,6 +1686,13 @@ def handler(job):
             "conditioning_strength_stage2": conditioning_strength_stage2,
             "conditioning_crf": 0, "dev_inference_steps": steps,  # lower => subject freer to move (un-freeze)
             "t2v": t2v,  # v8.17: text-to-video (no conditioning image)
+            # Hidden R&D-only long-horizon lever. Omission is exactly off.
+            "terminal_keyframe_strength_stage1": (
+                requested_terminal_keyframe_strength_stage1 or 0.0
+            ),
+            "terminal_keyframe_strength_stage2": (
+                requested_terminal_keyframe_strength_stage2 or 0.0
+            ),
         }
         # CAS crispness pass (default-on). Per-request override for A/B; omit in prod => env/default.
         if cas_amount is not None:
@@ -1928,6 +1960,43 @@ def handler(job):
                     ),
                     "source": conditioning_strength_source,
                     "frame_index": None if t2v else 0,
+                },
+                "terminal_keyframe": {
+                    "enabled": bool(
+                        not t2v
+                        and (
+                            settings["terminal_keyframe_strength_stage1"] > 0.0
+                            or settings["terminal_keyframe_strength_stage2"] > 0.0
+                        )
+                    ),
+                    "frame_index": (
+                        settings["frames"] - 1
+                        if not t2v
+                        and (
+                            settings["terminal_keyframe_strength_stage1"] > 0.0
+                            or settings["terminal_keyframe_strength_stage2"] > 0.0
+                        )
+                        else None
+                    ),
+                    "stage1_strength": (
+                        None
+                        if t2v
+                        else settings["terminal_keyframe_strength_stage1"]
+                    ),
+                    "stage2_strength": (
+                        None
+                        if t2v
+                        else settings["terminal_keyframe_strength_stage2"]
+                    ),
+                    "source": (
+                        "request"
+                        if not t2v
+                        and (
+                            requested_terminal_keyframe_strength_stage1 is not None
+                            or requested_terminal_keyframe_strength_stage2 is not None
+                        )
+                        else "off"
+                    ),
                 },
                 "negative_prompt": {
                     "source": negative_prompt_source,
