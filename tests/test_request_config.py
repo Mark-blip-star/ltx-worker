@@ -15,6 +15,7 @@ from request_config import (
     resolve_optional_step_count,
     resolve_stage_conditioning_strengths,
     resolve_stage2_sigmas,
+    resolve_still_crf,
     sampling_schedule_tag_suffix,
     stage_conditioning_strength_tag_suffix,
 )
@@ -274,6 +275,21 @@ class SamplingScheduleTests(unittest.TestCase):
         self.assertRegex(candidate, r"^-s1st15-s2st4-s2h[0-9a-f]{12}$")
         self.assertNotEqual(candidate, same_count_other_grid)
         self.assertNotEqual(candidate, other_allocation)
+
+
+class StillCrfTests(unittest.TestCase):
+    def test_omitted_returns_none(self) -> None:
+        self.assertIsNone(resolve_still_crf({}))
+
+    def test_accepts_off_and_bounded_range(self) -> None:
+        for value in (0, 20, 33, 45):
+            with self.subTest(value=value):
+                self.assertEqual(resolve_still_crf({"still_crf": value}), value)
+
+    def test_rejects_bool_float_string_and_out_of_range(self) -> None:
+        for value in (True, 33.0, "33", 10, 46, 19):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                resolve_still_crf({"still_crf": value})
 
 
 if __name__ == "__main__":

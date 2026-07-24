@@ -135,6 +135,53 @@ class QualityStepAllocationWiringTests(unittest.TestCase):
         self.assertIn('"stage2_sigmas": _STAGE2_FAST', self.handler)
 
 
+class StillCrfWiringTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.handler = (ROOT / "handler.py").read_text()
+
+    def test_still_crf_is_rejected_for_t2v(self) -> None:
+        self.assertIn(
+            "if t2v and requested_still_crf:",
+            self.handler,
+        )
+        self.assertIn(
+            '"detail": "still_crf requires image_b64",',
+            self.handler,
+        )
+
+    def test_conditioning_crf_is_wired_to_request_still_crf(self) -> None:
+        self.assertIn(
+            '"conditioning_crf": still_crf,',
+            self.handler,
+        )
+        self.assertIn(
+            "still_crf = requested_still_crf or 0",
+            self.handler,
+        )
+        # The warmup settings dict must stay hardcoded off.
+        self.assertIn(
+            '"conditioning_strength": 0.8, "conditioning_crf": 0,',
+            self.handler,
+        )
+
+    def test_config_tag_gets_crf_suffix(self) -> None:
+        self.assertIn(
+            '+ (f"-crf{still_crf}" if still_crf else "")',
+            self.handler,
+        )
+
+    def test_effective_config_attests_still_crf(self) -> None:
+        self.assertIn(
+            '"still_crf": {',
+            self.handler,
+        )
+        self.assertIn(
+            '"applied": bool(still_crf) and not t2v,',
+            self.handler,
+        )
+
+
 class RegionalCompileResponseTelemetryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

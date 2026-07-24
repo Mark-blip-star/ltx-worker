@@ -116,6 +116,7 @@ from request_config import (  # noqa: E402
     resolve_optional_step_count,
     resolve_stage_conditioning_strengths,
     resolve_stage2_sigmas,
+    resolve_still_crf,
     sampling_schedule_tag_suffix,
     stage_conditioning_strength_tag_suffix,
 )
@@ -1520,6 +1521,7 @@ def handler(job):
             )
             requested_stage1_steps = resolve_optional_step_count(inp)
             requested_stage2_sigmas = resolve_stage2_sigmas(inp)
+            requested_still_crf = resolve_still_crf(inp)
         except ValueError as exc:
             return {
                 "error": "invalid_request",
@@ -1610,6 +1612,13 @@ def handler(job):
                 "detail": "terminal keyframe strengths require image_b64",
                 "config_tag": f"{CONFIG_TAG}-{tier}",
             }
+        if t2v and requested_still_crf:
+            return {
+                "error": "invalid_request",
+                "detail": "still_crf requires image_b64",
+                "config_tag": f"{CONFIG_TAG}-{tier}",
+            }
+        still_crf = requested_still_crf or 0
         img_path = _IN / "req"
         if not t2v:
             with open(img_path, "wb") as f:
@@ -1684,7 +1693,7 @@ def handler(job):
             "conditioning_strength": conditioning_strength_stage1,
             "conditioning_strength_stage1": conditioning_strength_stage1,
             "conditioning_strength_stage2": conditioning_strength_stage2,
-            "conditioning_crf": 0, "dev_inference_steps": steps,  # lower => subject freer to move (un-freeze)
+            "conditioning_crf": still_crf, "dev_inference_steps": steps,  # lower => subject freer to move (un-freeze)
             "t2v": t2v,  # v8.17: text-to-video (no conditioning image)
             # Hidden R&D-only long-horizon lever. Omission is exactly off.
             "terminal_keyframe_strength_stage1": (
@@ -1892,7 +1901,8 @@ def handler(job):
                            + (f"-dn{inp['decode_noise']}" if "decode_noise" in inp else "")
                            + (f"-cfg{inp['cfg']}" if "cfg" in inp else "") + ("-cfgcache" if inp.get("cfg_cache") else "")
                            + (f"-mod{inp['modality']}" if "modality" in inp else "")
-                           + (f"-dd{inp['detail_daemon']}" if "detail_daemon" in inp else "")),
+                           + (f"-dd{inp['detail_daemon']}" if "detail_daemon" in inp else "")
+                           + (f"-crf{still_crf}" if still_crf else "")),
             "tier": tier,
             "effective_config": {
                 "sampler": {
@@ -1960,6 +1970,11 @@ def handler(job):
                     ),
                     "source": conditioning_strength_source,
                     "frame_index": None if t2v else 0,
+                },
+                "still_crf": {
+                    "value": still_crf,
+                    "source": "request" if requested_still_crf is not None else "off",
+                    "applied": bool(still_crf) and not t2v,
                 },
                 "terminal_keyframe": {
                     "enabled": bool(

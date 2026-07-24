@@ -19,6 +19,8 @@ MIN_STAGE1_STEPS = 1
 MAX_STAGE1_STEPS = 64
 MIN_STAGE2_SIGMA_POINTS = 2
 MAX_STAGE2_SIGMA_POINTS = 16
+MIN_STILL_CRF = 20
+MAX_STILL_CRF = 45
 
 
 def resolve_boolean(payload: Mapping[str, Any], key: str, default: bool) -> bool:
@@ -73,6 +75,28 @@ def resolve_optional_step_count(
     if not MIN_STAGE1_STEPS <= value <= MAX_STAGE1_STEPS:
         raise ValueError(
             f"{key} must be between {MIN_STAGE1_STEPS} and {MAX_STAGE1_STEPS}"
+        )
+    return value
+
+
+def resolve_still_crf(
+    payload: Mapping[str, Any],
+    key: str = "still_crf",
+) -> int | None:
+    """Validate an optional integer conditioning-image codec CRF override.
+
+    ``None`` means the request omitted the lever, so still_crf stays off.
+    ``0`` is an explicit off. JSON booleans are rejected even though ``bool``
+    subclasses ``int`` in Python.
+    """
+    if key not in payload:
+        return None
+    value = payload[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{key} must be an integer")
+    if value != 0 and not MIN_STILL_CRF <= value <= MAX_STILL_CRF:
+        raise ValueError(
+            f"{key} must be 0 (off) or between {MIN_STILL_CRF} and {MAX_STILL_CRF}"
         )
     return value
 
