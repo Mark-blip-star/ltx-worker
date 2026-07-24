@@ -336,7 +336,20 @@ async function execute(spec) {
     idleTimeout: endpoint.idleTimeout,
     flashboot: endpoint.flashboot,
   };
-  if (JSON.stringify(observed) !== JSON.stringify(freeze.endpoint)) {
+  const frozenServingPolicy = {
+    id: freeze.endpoint.id,
+    templateId: freeze.endpoint.templateId,
+    workersMin: freeze.endpoint.workersMin,
+    workersMax: freeze.endpoint.workersMax,
+    idleTimeout: freeze.endpoint.idleTimeout,
+    flashboot: freeze.endpoint.flashboot,
+  };
+  if (
+    JSON.stringify(observed) !== JSON.stringify(frozenServingPolicy) ||
+    (Array.isArray(freeze.endpoint.gpuTypeIds) &&
+      JSON.stringify(endpoint.gpuTypeIds) !==
+        JSON.stringify(freeze.endpoint.gpuTypeIds))
+  ) {
     fail('Live endpoint differs from the frozen fixed-pool policy');
   }
 

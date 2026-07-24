@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "experimentId": "terminal-keyframe-stage1-015-screening-10s-v1",
+  "artifactSuffix": "terminal_keyframe_s1_0_15",
+  "requireExtraLora": false,
+  "description": "Preregistered matched-seed screen of a weaker final-frame guiding keyframe at stage 1 only, selected from the completed 0.25 trade-off result.",
+  "baselineRunRelativePath": "benchmark/runs/quality-conditioning-stage-factorial-10s-v1-restart1",
+  "defaults": {
+    "width": 1280,
+    "height": 704,
+    "frames": 241,
+    "fps": 24,
+    "audio": true,
+    "tier": "quality",
+    "enhance": false,
+    "cas_amount": 0,
+    "cfg_cache": true,
+    "cfg_cache_range": "4:9",
+    "stage1_ge": true,
+    "conditioning_strength_stage1": 0.8,
+    "conditioning_strength_stage2": 0.8,
+    "terminal_keyframe_strength_stage1": 0.15,
+    "terminal_keyframe_strength_stage2": 0
+  },
+  "warmup": {
+    "caseId": "waterfall",
+    "seed": 93004,
+    "scored": false
+  },
+  "cases": [
+    {
+      "id": "samurai",
+      "expectedPeople": 1,
+      "seed": 73101,
+      "motionPrompt": "The same single samurai remains the only person visible and performs one controlled horizontal sword swing with a clear wind-up, clean arc, weight transfer and complete follow-through. The body, armor, face and single sword remain consistent. The full body stays visible at the same scale and safe camera distance throughout. No new people or objects enter; no duplication, disappearance, camera collision or subject exit. Static wide camera."
+    },
+    {
+      "id": "chef",
+      "expectedPeople": 1,
+      "seed": 73102,
+      "motionPrompt": "The same single chef remains the only person visible and completes one controlled wok toss: the wrist lifts the same pan, the food rises briefly, and all food lands back in that pan. Both hands, arms, utensil, pan and face remain coherent throughout. The chef stays fully visible at the same scale; no new people, hands, utensils or cookware appear. Static medium-wide camera with no cuts or camera collision."
+    },
+    {
+      "id": "dancer",
+      "expectedPeople": 1,
+      "seed": 63103,
+      "motionPrompt": "The same single dancer remains the only person visible and performs one fast controlled turn with natural preparation, weight transfer, rotation, complete landing and a stable final pose. The face, body, clothes and limb count remain consistent. The full body stays visible at the same scale and never exits the frame. No new people, reflections or duplicate limbs appear. Static wide camera with no cuts or camera movement."
+    },
+    {
+      "id": "waterfall",
+      "expectedPeople": 0,
+      "seed": 73104,
+      "motionPrompt": "The same waterfall flows continuously while mist drifts softly, gentle ripples spread across the same pool, and a few leaves move in a light breeze. The rock geometry, trees, lighting and waterfall structure remain stable. No people, faces, animals, buildings, boats, signs or new objects appear. Static tripod camera with no zoom, pan, cuts or viewpoint change."
+    }
+  ]
+}
