@@ -1,7 +1,10 @@
+import hashlib
 import logging
+import os
 from dataclasses import dataclass, field, replace
 from typing import Generic
 
+import safetensors.torch
 import torch
 from torch import nn
 
@@ -51,9 +54,36 @@ def _load_model_weights(
     if lora_load_device is None:
         lora_load_device = device
 
+    lora_strengths = [lora.strength for lora in loras]
+    fused_needed = bool(loras) and not (
+        lora_strengths and min(lora_strengths) == 0 and max(lora_strengths) == 0
+    )
+    if fused_needed and os.environ.get("LTX_FUSED_CACHE", "1") == "1":
+        # Фʼюжн детермінований по (ckpt, lora@strength, dtype) — готовий SD можна
+        # читати напряму, минаючи стрімінг лор з CPU і фʼюжн-математику (25-45с холодного).
+        # Джерела: $LTX_FUSED_DIR, потім <тека чекпоінта>/fused (Model Store стейджить її з репо).
+        paths = model_path if isinstance(model_path, (tuple, list)) else (model_path,)
+        # Ключ по basename'ах: абсолютні шляхи різняться між платформами (Modal /vol/...,
+        # RunPod /runpod-volume/...), а кеш має бути спільним артефактом.
+        key_src = "|".join(os.path.basename(str(p)) for p in paths) + "||" + \
+                  "|".join(f"{os.path.basename(str(lr.path))}@{lr.strength}" for lr in loras) + f"||{dtype}"
+        key = hashlib.sha1(key_src.encode()).hexdigest()[:16]
+        candidates = []
+        if os.environ.get("LTX_FUSED_DIR"):
+            candidates.append(os.path.join(os.environ["LTX_FUSED_DIR"], f"{key}.safetensors"))
+        candidates.append(os.path.join(os.path.dirname(str(paths[0])), "fused", f"{key}.safetensors"))
+        for fpath in candidates:
+            if os.path.exists(fpath):
+                sd = safetensors.torch.load_file(fpath, device=str(device))
+                meta_model.load_state_dict(sd, strict=False, assign=True)
+                logger.info(f"fused-cache HIT {key}: {len(sd)} tensors from {fpath}")
+                return
+        save_dir = os.environ.get("LTX_FUSED_SAVE_DIR")
+    else:
+        save_dir = None
+
     model_sd = load_state_dict(model_path, loader, registry, device, model_sd_ops)
 
-    lora_strengths = [lora.strength for lora in loras]
     if not lora_strengths or (min(lora_strengths) == 0 and max(lora_strengths) == 0):
         sd = model_sd.sd
         if dtype is not None:
@@ -80,6 +110,17 @@ def _load_model_weights(
         destination_sd=model_sd if isinstance(registry, DummyRegistry) else None,
     )
     meta_model.load_state_dict(final_sd.sd, strict=False, assign=True)
+    if save_dir:
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+            fpath = os.path.join(save_dir, f"{key}.safetensors")
+            sd_cpu = {k: v.detach().to("cpu", copy=True).contiguous()
+                      for k, v in meta_model.state_dict().items()}
+            safetensors.torch.save_file(sd_cpu, fpath + ".tmp")
+            os.replace(fpath + ".tmp", fpath)
+            logger.info(f"fused-cache SAVED {key} -> {fpath}")
+        except Exception as exc:  # noqa: BLE001 — кеш не критичний, білд уже вдався
+            logger.warning(f"fused-cache save skipped: {exc!r}")
 
 
 @dataclass(frozen=True)

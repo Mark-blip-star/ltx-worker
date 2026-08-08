@@ -92,7 +92,8 @@ def euler_denoising_loop(
     tuple[LatentState | None, LatentState | None]
         Final ``(video_state, audio_state)`` after the denoising loop.
     """
-    for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
+    _sig_cpu = sigmas.detach().cpu().tolist()  # CPU-контроль лупу
+    for step_idx in tqdm(range(len(_sig_cpu) - 1)):
         video_result, audio_result = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
         denoised_video = video_result.denoised if video_result is not None else None
         denoised_audio = audio_result.denoised if audio_result is not None else None
@@ -140,7 +141,8 @@ def gradient_estimating_euler_denoising_loop(
             denoised_sample = to_denoised(noisy_sample, total_velocity, sigma)
         return current_velocity, denoised_sample
 
-    for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
+    _sig_cpu = sigmas.detach().cpu().tolist()  # CPU-контроль лупу
+    for step_idx in tqdm(range(len(_sig_cpu) - 1)):
         video_result, audio_result = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
         denoised_video = video_result.denoised if video_result is not None else None
         denoised_audio = audio_result.denoised if audio_result is not None else None
@@ -151,7 +153,7 @@ def gradient_estimating_euler_denoising_loop(
         if audio_state is not None and denoised_audio is not None:
             denoised_audio = post_process_latent(denoised_audio, audio_state.denoise_mask, audio_state.clean_latent)
 
-        if sigmas[step_idx + 1] == 0:
+        if _sig_cpu[step_idx + 1] == 0:
             if video_state is not None and denoised_video is not None:
                 video_state = replace(video_state, latent=denoised_video)
             if audio_state is not None and denoised_audio is not None:
@@ -523,7 +525,8 @@ def euler_cfg_pp_denoising_loop(
     generator = torch.Generator(device=present_state.latent.device).manual_seed(noise_seed)
     draw_noise = stepper.eta > 0 and stepper.s_noise > 0
 
-    for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
+    _sig_cpu = sigmas.detach().cpu().tolist()  # CPU-контроль лупу
+    for step_idx in tqdm(range(len(_sig_cpu) - 1)):
         video_result, audio_result = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
         denoised_video = video_result.denoised if video_result is not None else None
         denoised_audio = audio_result.denoised if audio_result is not None else None
@@ -548,7 +551,7 @@ def euler_cfg_pp_denoising_loop(
         if audio_state is not None and denoised_audio is not None:
             denoised_audio = post_process_latent(denoised_audio, audio_state.denoise_mask, audio_state.clean_latent)
 
-        if sigmas[step_idx + 1] == 0:
+        if _sig_cpu[step_idx + 1] == 0:
             if video_state is not None and denoised_video is not None:
                 video_state = replace(video_state, latent=denoised_video.to(model_dtype))
             if audio_state is not None and denoised_audio is not None:
