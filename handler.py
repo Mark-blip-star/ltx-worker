@@ -219,6 +219,11 @@ WARMUP_GEN = os.environ.get("LTX_WARMUP_GEN", "0") == "1"  # full prod-shape gen
 # 640x352 micro job fully absorbed it), so representative kernel families on random tensors can
 # absorb it during init while the DMA engines stream weights. Local generator — global RNG untouched.
 GPU_PREWARM = os.environ.get("LTX_GPU_PREWARM", "0") == "1"
+# W-2a: build the resident stage transformers inside init instead of on the first generation
+# (the +22s gen1 residual IS this build — W-1 dummy kernels proved it's not CUDA warmup).
+# Safe here: pre-seed runs under _INIT_LOCK, so no job can race _StageKeyedCache.get
+# (the Modal B-v0 lock caveat applies only to builds outside the init lock).
+EAGER_RESIDENTS = os.environ.get("LTX_EAGER_RESIDENTS", "0") == "1"
 _S3 = {k: os.environ.get(f"LTX_S3_{k}") for k in ("ENDPOINT", "BUCKET", "KEY", "SECRET")}
 S3_ON = all(_S3.values())
 RETURN_URL_ONLY = os.environ.get("LTX_RETURN_URL_ONLY", "0") == "1"
@@ -862,6 +867,16 @@ def _init():
             pipe.prompt_encoder = enc
             _PIPE = pipe
             _INIT_LOG.append("pipeline built — ready")
+            if EAGER_RESIDENTS:
+                try:
+                    _t0 = time.time()
+                    _STAGE_CACHE.get(pipe.stage_1, "stage1", video_tools=None, lifecycle_stats=None)
+                    _mark(f"eager_resident_stage1 {time.time() - _t0:.1f}s")
+                    _t1 = time.time()
+                    _STAGE_CACHE.get(pipe.stage_2, "stage2", video_tools=None, lifecycle_stats=None)
+                    _mark(f"eager_resident_stage2 {time.time() - _t1:.1f}s")
+                except Exception as exc:  # noqa: BLE001 — non-fatal: gen1 falls back to lazy build
+                    _INIT_LOG.append(f"eager-residents FAILED (non-fatal): {exc!r}")
             if WARMUP_GEN:
                 try:
                     _warmup_generation()
