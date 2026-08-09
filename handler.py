@@ -214,6 +214,11 @@ CONFIG_TAG = (os.environ.get("LTX_CONFIG_TAG", "v8")
 # except the always-on bit-exact changes (resident tail, stream-yield decode), gated by PSNR.
 SKIP_NEG_ENCODE = os.environ.get("LTX_SKIP_NEG_ENCODE", "0") == "1"  # bit-exact: prompts encode sequentially
 WARMUP_GEN = os.environ.get("LTX_WARMUP_GEN", "0") == "1"  # full prod-shape generation inside init
+# W-1: dummy-tensor GPU prewarm on a side stream, concurrent with the weight loads. Measurement
+# 2026-08-09 (dark): the +22s gen1 residual is shape-independent GPU-context warmup (a FAILED
+# 640x352 micro job fully absorbed it), so representative kernel families on random tensors can
+# absorb it during init while the DMA engines stream weights. Local generator — global RNG untouched.
+GPU_PREWARM = os.environ.get("LTX_GPU_PREWARM", "0") == "1"
 _S3 = {k: os.environ.get(f"LTX_S3_{k}") for k in ("ENDPOINT", "BUCKET", "KEY", "SECRET")}
 S3_ON = all(_S3.values())
 RETURN_URL_ONLY = os.environ.get("LTX_RETURN_URL_ONLY", "0") == "1"
@@ -692,6 +697,52 @@ def _warmup_generation():
     _INIT_LOG.append(f"warmup-gen ok in {_t.time() - t0:.1f}s; timers={rec.get('timers')}")
 
 
+def _gpu_prewarm():
+    """W-1: absorb the shape-independent GPU-context warmup (cuBLAS/cuDNN handles, scaled_mm,
+    SDPA, conv kernel modules, allocator pool growth) on dummy tensors, on a SIDE stream so it
+    overlaps the loader's H2D copies instead of serializing behind them. Values are garbage and
+    discarded; a local generator keeps the global RNG untouched (bit-exactness contract)."""
+    import time as _t
+    t0 = _t.time()
+    try:
+        stream = torch.cuda.Stream()
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        with torch.cuda.stream(stream), torch.inference_mode():
+            dev = torch.device("cuda")
+            # allocator stretch: grow the caching pool so gen1 never calls cudaMalloc mid-step
+            pool = [torch.empty(1024, 1024, 1024, dtype=torch.bfloat16, device=dev) for _ in range(4)]
+            for p in pool:
+                p.zero_()
+            del pool
+            # cuBLAS bf16 GEMMs at transformer-ish shapes
+            a = torch.randn(32768, 4096, dtype=torch.bfloat16, device=dev, generator=gen)
+            b = torch.randn(4096, 4096, dtype=torch.bfloat16, device=dev, generator=gen)
+            for _ in range(3):
+                a = a @ b
+            # fp8 scaled_mm — prod matmul path (trtllm unusable in this image, see scaled_mm_path mark)
+            f8 = torch.float8_e4m3fn
+            x8 = torch.randn(16384, 4096, device=dev, generator=gen).to(f8)
+            w8 = torch.randn(4096, 4096, device=dev, generator=gen).to(f8).t().contiguous().t()
+            sx = torch.ones((), device=dev)
+            for _ in range(3):
+                torch._scaled_mm(x8, w8, scale_a=sx, scale_b=sx, out_dtype=torch.bfloat16)
+            # SDPA (flash path) at video-ish sequence lengths
+            q = torch.randn(1, 32, 16384, 128, dtype=torch.bfloat16, device=dev, generator=gen)
+            torch.nn.functional.scaled_dot_product_attention(q, q, q)
+            # conv families for VAE/upsampler
+            v = torch.randn(1, 128, 4, 88, 160, dtype=torch.bfloat16, device=dev, generator=gen)
+            torch.nn.functional.conv3d(v, torch.randn(128, 128, 3, 3, 3, dtype=torch.bfloat16, device=dev,
+                                                      generator=gen), padding=1)
+            u = torch.randn(1, 128, 704, 1280, dtype=torch.bfloat16, device=dev, generator=gen)
+            torch.nn.functional.conv2d(u, torch.randn(128, 128, 3, 3, dtype=torch.bfloat16, device=dev,
+                                                      generator=gen), padding=1)
+        stream.synchronize()
+        torch.cuda.synchronize()
+        _mark(f"gpu_prewarm_done {_t.time() - t0:.1f}s")
+    except Exception as exc:  # noqa: BLE001 — prewarm is best-effort, never fails init
+        _INIT_LOG.append(f"gpu-prewarm FAILED (non-fatal, {_t.time() - t0:.1f}s): {exc!r}")
+
+
 def _init():
     """Idempotent, thread-safe init. Called eagerly from a daemon thread at process start
     (H-1) and again by every handler invocation (no-op once done; blocks while in-flight)."""
@@ -701,6 +752,10 @@ def _init():
             return
         try:
             _mark("init_start")
+            prewarm_t = None
+            if GPU_PREWARM:
+                prewarm_t = threading.Thread(target=_gpu_prewarm, daemon=True, name="gpu-prewarm")
+                prewarm_t.start()
             snap = _resolve_repo()
             _mark("snapshot_resolved")
             ckpt = os.path.join(snap, FP8_CKPT_NAME)
@@ -814,6 +869,10 @@ def _init():
                 except Exception as exc:  # noqa: BLE001
                     _INIT_LOG.append(f"warmup-gen FAILED (non-fatal): {exc!r}")
                     _mark("warmup_gen_failed")
+            if prewarm_t is not None:
+                prewarm_t.join(timeout=45)
+                if prewarm_t.is_alive():
+                    _INIT_LOG.append("gpu-prewarm still running at ready (join timeout) — not blocking")
             _mark("ready")
         except Exception:
             _INIT_ERR = "INIT LOG:\n" + "\n".join(_INIT_LOG) + "\n\nTRACEBACK:\n" + traceback.format_exc()
