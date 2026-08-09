@@ -253,6 +253,11 @@ _FIRST_JOB_SEEN = False
 # both stage builds can finish within the same tick and double-trigger it otherwise.
 _EAGER_PARALLEL = {"on": False}
 _TAIL_PIN_LOCK = threading.Lock()
+# W-2e: stage2 keeps building in the background AFTER ready (it is not needed until ~19s into
+# the first generation), so a job's stage2 get() may race the background build. Per-key locks
+# turn that race into "wait for the in-flight build, then hit the cache" — never a double build.
+_STAGE_BUILD_LOCKS = {"stage1": threading.Lock(), "stage2": threading.Lock()}
+_EAGER_BG = {"thread": None}
 
 
 class _StageKeyedCache(base.ResidentStageCache):
@@ -264,6 +269,10 @@ class _StageKeyedCache(base.ResidentStageCache):
         return graph_key
 
     def get(self, stage, cache_key, **kw):
+        with _STAGE_BUILD_LOCKS.get(cache_key) or threading.Lock():
+            return self._get_locked(stage, cache_key, **kw)
+
+    def _get_locked(self, stage, cache_key, **kw):
         hit = cache_key in self._entries
         out = super().get(stage, cache_key, **kw)
         # v8.6.1: with the distilled LoRA fused into stage1 too, no live model shares the
@@ -867,21 +876,33 @@ def _init():
                     # here and stream from NVMe in parallel with each other AND the Gemma build.
                     # v8.24.4: parallel stage loads measured SLOWER (host storage tops out
                     # ~2.8GB/s aggregate — three streams just thrash it; gemma 3s->14s,
-                    # s1 7.7s->25s) and the concurrent s2 build failed outright. Default is
-                    # v8.24.5 W-2d: ONE chained future (s1 then s2, no mutual thrash) that
-                    # overlaps the Gemma build; loads come from the L-4-warmed page cache
-                    # through the pinned H2D path, so the chain is PCIe-bound, not disk-bound.
+                    # s1 7.7s->25s) and the concurrent s2 build failed outright.
+                    # v8.24.6 W-2e: ready gates on stage1 only — stage2 isn't touched until
+                    # ~19s into the first generation, so its build hides inside stage1 compute
+                    # (PCIe copies and SMs are different engines). The daemon thread outlives
+                    # this executor block on purpose; get()'s per-key lock closes the race.
                     if EAGER_RESIDENTS:
                         if os.environ.get("LTX_EAGER_PARALLEL", "0") == "1":
                             _EAGER_PARALLEL["on"] = True
                             f_stages = [ex.submit(_eager_stage, pipe.stage_1, "stage1"),
                                         ex.submit(_eager_stage, pipe.stage_2, "stage2")]
                         else:
-                            def _eager_chain(p=pipe):
-                                _eager_stage(p.stage_1, "stage1")
+                            s1_done = threading.Event()
+
+                            def _eager_bg(p=pipe):
+                                try:
+                                    _eager_stage(p.stage_1, "stage1")
+                                finally:
+                                    s1_done.set()
                                 _eager_stage(p.stage_2, "stage2")
-                            f_stages = [ex.submit(_eager_chain)]
-                        # executor shutdown at `with` exit joins the stage futures too
+
+                            t_bg = threading.Thread(target=_eager_bg, daemon=True, name="eager-stages")
+                            _EAGER_BG["thread"] = t_bg
+                            t_bg.start()
+                            if os.environ.get("LTX_EAGER_ASYNC_S2", "0") == "1":
+                                s1_done.wait(timeout=180)
+                            else:
+                                t_bg.join(timeout=360)
                     te = f_te.result()
             else:
                 pipe = _build_pipe()
@@ -917,9 +938,12 @@ def _init():
             _INIT_LOG.append("pipeline built — ready")
             if EAGER_RESIDENTS:  # sequential fallback (LTX_PARALLEL_INIT=0 or a chain/parallel failure)
                 try:
+                    _bg = _EAGER_BG.get("thread")
                     for _stage, _key in ((pipe.stage_1, "stage1"), (pipe.stage_2, "stage2")):
                         if _key in _STAGE_CACHE._entries:
                             continue
+                        if _bg is not None and _bg.is_alive():
+                            continue  # W-2e: still building in the background — don't gate ready on it
                         _t0 = time.time()
                         _STAGE_CACHE.get(_stage, _key, video_tools=None, lifecycle_stats=None)
                         _mark(f"eager_resident_{_key} {time.time() - _t0:.1f}s (sequential)")
