@@ -74,7 +74,19 @@ def _load_model_weights(
         candidates.append(os.path.join(os.path.dirname(str(paths[0])), "fused", f"{key}.safetensors"))
         for fpath in candidates:
             if os.path.exists(fpath):
-                sd = safetensors.torch.load_file(fpath, device=str(device))
+                if os.environ.get("LTX_FUSED_PINNED", "0") == "1" and device.type == "cuda":
+                    # W-2d: load_file(device=cuda) moves pageable memory at ~2.8GB/s; going
+                    # through a pinned staging copy roughly triples the PCIe rate. The CPU sd
+                    # is an mmap view (page-cache-warm via the L-4 fused-first prewarm), so
+                    # pin_memory+async H2D is the only real work here.
+                    sd_cpu = safetensors.torch.load_file(fpath, device="cpu")
+                    sd = {}
+                    for k, v in sd_cpu.items():
+                        sd[k] = v.pin_memory().to(device, non_blocking=True)
+                    torch.cuda.synchronize(device)
+                    del sd_cpu
+                else:
+                    sd = safetensors.torch.load_file(fpath, device=str(device))
                 meta_model.load_state_dict(sd, strict=False, assign=True)
                 logger.info(f"fused-cache HIT {key}: {len(sd)} tensors from {fpath}")
                 return

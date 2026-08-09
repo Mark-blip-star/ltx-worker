@@ -867,12 +867,20 @@ def _init():
                     # here and stream from NVMe in parallel with each other AND the Gemma build.
                     # v8.24.4: parallel stage loads measured SLOWER (host storage tops out
                     # ~2.8GB/s aggregate — three streams just thrash it; gemma 3s->14s,
-                    # s1 7.7s->25s) and the concurrent s2 build failed outright. Default off;
-                    # sequential eager below rides the L-4 fused-first page cache instead.
-                    if EAGER_RESIDENTS and os.environ.get("LTX_EAGER_PARALLEL", "0") == "1":
-                        _EAGER_PARALLEL["on"] = True
-                        f_stages = [ex.submit(_eager_stage, pipe.stage_1, "stage1"),
-                                    ex.submit(_eager_stage, pipe.stage_2, "stage2")]
+                    # s1 7.7s->25s) and the concurrent s2 build failed outright. Default is
+                    # v8.24.5 W-2d: ONE chained future (s1 then s2, no mutual thrash) that
+                    # overlaps the Gemma build; loads come from the L-4-warmed page cache
+                    # through the pinned H2D path, so the chain is PCIe-bound, not disk-bound.
+                    if EAGER_RESIDENTS:
+                        if os.environ.get("LTX_EAGER_PARALLEL", "0") == "1":
+                            _EAGER_PARALLEL["on"] = True
+                            f_stages = [ex.submit(_eager_stage, pipe.stage_1, "stage1"),
+                                        ex.submit(_eager_stage, pipe.stage_2, "stage2")]
+                        else:
+                            def _eager_chain(p=pipe):
+                                _eager_stage(p.stage_1, "stage1")
+                                _eager_stage(p.stage_2, "stage2")
+                            f_stages = [ex.submit(_eager_chain)]
                         # executor shutdown at `with` exit joins the stage futures too
                     te = f_te.result()
             else:
@@ -880,20 +888,18 @@ def _init():
                 te = gemma_builder.build(device=torch.device("cuda"), dtype=torch.bfloat16)
 
             if f_stages:  # W-2b post-join: deferred side effects of the parallel builds
+                was_parallel = _EAGER_PARALLEL["on"]
                 _EAGER_PARALLEL["on"] = False
                 stage_errs = [f.exception() for f in f_stages]
                 for e in stage_errs:
                     if e:
-                        _INIT_LOG.append(f"eager-parallel stage FAILED (non-fatal): {e!r}")
-                if S1_LORA_STRENGTH > 0 and not any(stage_errs):
+                        _INIT_LOG.append(f"eager stage build FAILED (non-fatal): {e!r}")
+                if was_parallel and S1_LORA_STRENGTH > 0 and not any(stage_errs):
                     _REGISTRY.clear()
                     torch.cuda.empty_cache()
                     _INIT_LOG.append(
                         f"registry cleared after parallel eager builds; "
                         f"cuda_alloc={torch.cuda.memory_allocated() / 2**30:.1f}GiB")
-                if len(_STAGE_CACHE._entries) >= 2:
-                    with _TAIL_PIN_LOCK:
-                        _make_tail_resident()
 
             # Measurement 2026-06-11: import tensorrt_llm fails on every boot (libpython3.12
             # unreachable in uv-standalone python) and prod has always run torch._scaled_mm.
@@ -909,7 +915,7 @@ def _init():
             pipe.prompt_encoder = enc
             _PIPE = pipe
             _INIT_LOG.append("pipeline built — ready")
-            if EAGER_RESIDENTS:  # sequential fallback (LTX_PARALLEL_INIT=0 or a parallel-build failure)
+            if EAGER_RESIDENTS:  # sequential fallback (LTX_PARALLEL_INIT=0 or a chain/parallel failure)
                 try:
                     for _stage, _key in ((pipe.stage_1, "stage1"), (pipe.stage_2, "stage2")):
                         if _key in _STAGE_CACHE._entries:
@@ -919,6 +925,10 @@ def _init():
                         _mark(f"eager_resident_{_key} {time.time() - _t0:.1f}s (sequential)")
                 except Exception as exc:  # noqa: BLE001 — non-fatal: gen1 falls back to lazy build
                     _INIT_LOG.append(f"eager-residents FAILED (non-fatal): {exc!r}")
+                # the in-build tail-pin trigger no-ops during init (_PIPE was still None) — pin here
+                if len(_STAGE_CACHE._entries) >= 2:
+                    with _TAIL_PIN_LOCK:
+                        _make_tail_resident()
             if WARMUP_GEN:
                 try:
                     _warmup_generation()
