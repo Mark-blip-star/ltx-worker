@@ -248,6 +248,13 @@ _GEMMA_DIR = None  # resolved gemma-fp8 snapshot subdir (cache-key/meta only aft
 _FIRST_JOB_SEEN = False
 
 
+# W-2b: during the parallel eager phase the per-build registry clear is deferred (a concurrent
+# clear could race the other stage's fused-MISS fallback read), and the tail pin is serialized —
+# both stage builds can finish within the same tick and double-trigger it otherwise.
+_EAGER_PARALLEL = {"on": False}
+_TAIL_PIN_LOCK = threading.Lock()
+
+
 class _StageKeyedCache(base.ResidentStageCache):
     """L-5: key resident transformers by stage only. SingleGPUModelBuilder.build ignores
     shape/fps/audio kwargs, so one transformer serves every request; the stock key_for
@@ -262,7 +269,7 @@ class _StageKeyedCache(base.ResidentStageCache):
         # v8.6.1: with the distilled LoRA fused into stage1 too, no live model shares the
         # registry's base SD — drop it after each stage build so at most two transformer
         # copies stay resident (three + activations busts the 94GB H100 NVL).
-        if S1_LORA_STRENGTH > 0 and not hit:
+        if S1_LORA_STRENGTH > 0 and not hit and not _EAGER_PARALLEL["on"]:
             _REGISTRY.clear()
             torch.cuda.empty_cache()
             _INIT_LOG.append(
@@ -271,8 +278,9 @@ class _StageKeyedCache(base.ResidentStageCache):
         # v8.7 L-1: once both stage transformers are resident the big build transients are
         # over — now (and only now) pin the small tail models, so their +~3.5 GiB never
         # coexists with a 22.6 GiB fuse transient on the 94 GB H100 NVL.
-        if not hit and len(self._entries) >= 2:
-            _make_tail_resident()
+        if not hit and len(self._entries) >= 2 and not _EAGER_PARALLEL["on"]:
+            with _TAIL_PIN_LOCK:
+                _make_tail_resident()
         return out
 
 
@@ -843,15 +851,45 @@ def _init():
             # LTX_PARALLEL_INIT=0 serializes the loads (rollback knob: concurrent Gemma +
             # LoRA-fusion spike is the known OOM pattern on smaller cards).
             from concurrent.futures import ThreadPoolExecutor
+
+            def _eager_stage(stage, key):
+                _t = time.time()
+                _STAGE_CACHE.get(stage, key, video_tools=None, lifecycle_stats=None)
+                _mark(f"eager_resident_{key} {time.time() - _t:.1f}s (parallel)")
+
+            f_stages = []
             if os.environ.get("LTX_PARALLEL_INIT", "1") == "1":
-                with ThreadPoolExecutor(max_workers=2) as ex:
+                with ThreadPoolExecutor(max_workers=4) as ex:
                     f_te = ex.submit(gemma_builder.build, device=torch.device("cuda"), dtype=torch.bfloat16)
                     f_pipe = ex.submit(_build_pipe)
                     pipe = f_pipe.result()
+                    # W-2b: the pipe build is lazy (~0.05s), so both fused stage loads can start
+                    # here and stream from NVMe in parallel with each other AND the Gemma build.
+                    if EAGER_RESIDENTS:
+                        _EAGER_PARALLEL["on"] = True
+                        f_stages = [ex.submit(_eager_stage, pipe.stage_1, "stage1"),
+                                    ex.submit(_eager_stage, pipe.stage_2, "stage2")]
+                        # executor shutdown at `with` exit joins the stage futures too
                     te = f_te.result()
             else:
                 pipe = _build_pipe()
                 te = gemma_builder.build(device=torch.device("cuda"), dtype=torch.bfloat16)
+
+            if f_stages:  # W-2b post-join: deferred side effects of the parallel builds
+                _EAGER_PARALLEL["on"] = False
+                stage_errs = [f.exception() for f in f_stages]
+                for e in stage_errs:
+                    if e:
+                        _INIT_LOG.append(f"eager-parallel stage FAILED (non-fatal): {e!r}")
+                if S1_LORA_STRENGTH > 0 and not any(stage_errs):
+                    _REGISTRY.clear()
+                    torch.cuda.empty_cache()
+                    _INIT_LOG.append(
+                        f"registry cleared after parallel eager builds; "
+                        f"cuda_alloc={torch.cuda.memory_allocated() / 2**30:.1f}GiB")
+                if len(_STAGE_CACHE._entries) >= 2:
+                    with _TAIL_PIN_LOCK:
+                        _make_tail_resident()
 
             # Measurement 2026-06-11: import tensorrt_llm fails on every boot (libpython3.12
             # unreachable in uv-standalone python) and prod has always run torch._scaled_mm.
@@ -867,14 +905,14 @@ def _init():
             pipe.prompt_encoder = enc
             _PIPE = pipe
             _INIT_LOG.append("pipeline built — ready")
-            if EAGER_RESIDENTS:
+            if EAGER_RESIDENTS:  # sequential fallback (LTX_PARALLEL_INIT=0 or a parallel-build failure)
                 try:
-                    _t0 = time.time()
-                    _STAGE_CACHE.get(pipe.stage_1, "stage1", video_tools=None, lifecycle_stats=None)
-                    _mark(f"eager_resident_stage1 {time.time() - _t0:.1f}s")
-                    _t1 = time.time()
-                    _STAGE_CACHE.get(pipe.stage_2, "stage2", video_tools=None, lifecycle_stats=None)
-                    _mark(f"eager_resident_stage2 {time.time() - _t1:.1f}s")
+                    for _stage, _key in ((pipe.stage_1, "stage1"), (pipe.stage_2, "stage2")):
+                        if _key in _STAGE_CACHE._entries:
+                            continue
+                        _t0 = time.time()
+                        _STAGE_CACHE.get(_stage, _key, video_tools=None, lifecycle_stats=None)
+                        _mark(f"eager_resident_{_key} {time.time() - _t0:.1f}s (sequential)")
                 except Exception as exc:  # noqa: BLE001 — non-fatal: gen1 falls back to lazy build
                     _INIT_LOG.append(f"eager-residents FAILED (non-fatal): {exc!r}")
             if WARMUP_GEN:
