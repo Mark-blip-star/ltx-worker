@@ -865,7 +865,11 @@ def _init():
                     pipe = f_pipe.result()
                     # W-2b: the pipe build is lazy (~0.05s), so both fused stage loads can start
                     # here and stream from NVMe in parallel with each other AND the Gemma build.
-                    if EAGER_RESIDENTS:
+                    # v8.24.4: parallel stage loads measured SLOWER (host storage tops out
+                    # ~2.8GB/s aggregate — three streams just thrash it; gemma 3s->14s,
+                    # s1 7.7s->25s) and the concurrent s2 build failed outright. Default off;
+                    # sequential eager below rides the L-4 fused-first page cache instead.
+                    if EAGER_RESIDENTS and os.environ.get("LTX_EAGER_PARALLEL", "0") == "1":
                         _EAGER_PARALLEL["on"] = True
                         f_stages = [ex.submit(_eager_stage, pipe.stage_1, "stage1"),
                                     ex.submit(_eager_stage, pipe.stage_2, "stage2")]

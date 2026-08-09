@@ -46,8 +46,9 @@ SNAP="${SNAP%/}"
   echo "[probe] done"
 } >> "$LOG" 2>&1 ) &
 
-# L-4: page-cache prewarm, ckpt first (its lazy re-read inside the FIRST GEN is the measured
-# slow-host tail). setsid leader -> handler kills the whole group at the first real job.
+# L-4: page-cache prewarm. v8.24.4: fused checkpoints first — with LTX_FUSED_CACHE they are
+# what init's eager resident builds actually read; the base ckpt stays as the fused-MISS fallback.
+# setsid leader -> handler kills the whole group at the first real job.
 if [ -d "$SNAP" ]; then
   setsid bash -c '
     SNAP="$1"
@@ -55,6 +56,7 @@ if [ -d "$SNAP" ]; then
     if [ "${AVAIL:-0}" -lt 80 ]; then echo "[prewarm] skipped available_gb=$AVAIL"; exit 0; fi
     echo "[prewarm] start available_gb=$AVAIL"
     for f in \
+        "$SNAP"/fused/*.safetensors \
         "$SNAP/${LTX_FP8_CKPT_NAME:-ltx-2.3-22b-dev-fp8.safetensors}" \
         "$SNAP/${LTX_GEMMA_FP8_SUBDIR:-gemma-fp8}"/*.safetensors \
         "$SNAP/${LTX_DISTILLED_LORA_NAME:-ltx-2.3-22b-distilled-lora-384-1.1.safetensors}" \
