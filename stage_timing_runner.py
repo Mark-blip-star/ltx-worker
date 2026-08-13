@@ -1230,15 +1230,33 @@ def _cas_sharpen_chunk(chunk: torch.Tensor, amount: float, mix: float) -> torch.
     return out.permute(0, 2, 3, 1).to(orig_dtype)
 
 
-def _maybe_decode_noise_scale_override() -> None:
-    """v8.10 L5 sweep knob. When LTX_DECODE_NOISE_SCALE is set, override the VAE decoder's
-    class-default decode_noise_scale (read per-instance at decode time). No-op when unset =>
-    bit-exact to v8.9. Idempotent."""
+def _maybe_decode_noise_scale_override(pipeline=None) -> None:
+    """v8.10 L5 sweep knob. v8.24.7 FIX: VideoDecoder.__init__ hardcodes the INSTANCE attr
+    (video_vae.py: self.decode_noise_scale = 0.025), so the class write below never reached a
+    live decoder — the July sweep produced byte-identical files. The lever must write the
+    instance too, and restore the stock 0.025 when the env is unset so a knob never leaks
+    across requests (handler is single-threaded)."""
     raw = os.environ.get("LTX_DECODE_NOISE_SCALE")
-    if raw is None:
-        return
+    val = 0.025 if raw is None else float(raw)  # 0.025 = constructor default in video_vae.py
     from ltx_core.model.video_vae.video_vae import VideoDecoder as _VaeVideoDecoder
-    _VaeVideoDecoder.decode_noise_scale = float(raw)
+    _VaeVideoDecoder.decode_noise_scale = val
+    dec = getattr(pipeline, "video_decoder", None)
+    inner = getattr(dec, "_dec", dec)  # handler wraps the real decoder in _ResidentDecoder
+    if inner is not None and hasattr(inner, "decode_noise_scale"):
+        inner.decode_noise_scale = val
+
+
+def _resolve_negative_prompt(case: dict) -> str:
+    """v8.24.7 quality knob: per-request "negative_prompt" wins, then env LTX_NEGATIVE_PROMPT,
+    then the stock DEFAULT_NEGATIVE_PROMPT. Empty string is a legal value (= no negative text);
+    the literal "none" also maps to empty because the RunPod console cannot store an empty env."""
+    raw = case.get("negative_prompt")
+    if raw is None:
+        raw = os.environ.get("LTX_NEGATIVE_PROMPT")
+    if raw is None:
+        return DEFAULT_NEGATIVE_PROMPT
+    raw = str(raw)
+    return "" if raw.strip().lower() == "none" else raw
 
 
 def _maybe_cas(decoded, settings: dict):
@@ -1323,9 +1341,11 @@ def run_case(
     tiling_config = None if args.no_tiling else TilingConfig.default()
     chunks = get_video_chunks_number(settings["frames"], tiling_config or TilingConfig.default())
 
+    negative_prompt = _resolve_negative_prompt(case)
+
     def encode_prompt() -> tuple[Any, Any]:
         return pipeline.prompt_encoder(
-            [case["prompt"], DEFAULT_NEGATIVE_PROMPT],
+            [case["prompt"], negative_prompt],
             enhance_first_prompt=False,
             enhance_prompt_image=(None if t2v else image.path),
             enhance_prompt_seed=case["seed"],
@@ -1338,7 +1358,7 @@ def run_case(
         else:
             prompt_key = prompt_cache.key(
                 prompt=case["prompt"],
-                negative_prompt=DEFAULT_NEGATIVE_PROMPT,
+                negative_prompt=negative_prompt,
                 image_path=(Path(image.path) if image else None),
                 seed=case["seed"],
                 gemma_root=args.gemma_root,
@@ -1561,7 +1581,7 @@ def run_case(
         )
     record["vram_after"]["stage2_transformer"] = peak_vram_gib()
 
-    _maybe_decode_noise_scale_override()  # v8.10 L5: no-op unless LTX_DECODE_NOISE_SCALE set
+    _maybe_decode_noise_scale_override(pipeline)  # v8.24.7: writes the live instance; stock 0.025 when unset
     with timed(timers, "video_vae_decode"):
         decoded_video = pipeline.video_decoder(video_state.latent, tiling_config, generator)
     decoded_video = _maybe_cas(decoded_video, settings)  # default-on crispness pass, before encode

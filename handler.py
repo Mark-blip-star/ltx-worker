@@ -1398,6 +1398,8 @@ def handler(job):
                 f.write(base64.b64decode(inp["image_b64"]))
         case = {"id": "req", "file": "req", "prompt": inp.get("prompt") or DEFAULT_PROMPT,
                 "seed": int(inp.get("seed", 3102))}
+        if "negative_prompt" in inp:  # v8.24.7 quality knob; absent => env/default (see runner)
+            case["negative_prompt"] = str(inp["negative_prompt"])
         raw_prompt = case["prompt"]
         enhanced_prompt = None
         # Prompt upsampler is the ALWAYS-ON product default (env LTX_ENHANCE=1 => ENHANCE_DEFAULT=True;
@@ -1523,6 +1525,9 @@ def handler(job):
             targs.video_cfg_scale = float(inp["cfg"]); guided = float(inp["cfg"]) > 1.0
         if "modality" in inp:
             targs.video_modality_scale = float(inp["modality"])
+        # v8.24.7 quality knob: per-request tile-free VAE decode (H200 fits full frames).
+        if inp.get("no_tiling"):
+            targs.no_tiling = True
         if inp.get("cfg_cache"):
             os.environ["LTX_CFG_CACHE"] = "1"
         elif not _CFG_CACHE_ENV:
