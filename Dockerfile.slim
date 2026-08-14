@@ -21,7 +21,7 @@ ENV PATH="/root/.local/bin:${PATH}"
 # Vanilla upstream at a pinned commit (recorded for provenance in /BUILD_COMMIT).
 RUN git clone --depth 1 https://github.com/Lightricks/LTX-2 /app/LTX-2 && \
     cd /app/LTX-2 && git rev-parse HEAD | tee /BUILD_COMMIT && \
-    uv python install 3.12 && uv sync --extra natten --python 3.12 && uv cache clean
+    uv python install 3.12 && uv sync --python 3.12 && uv cache clean
 ENV VENV=/app/LTX-2/.venv PATH="/app/LTX-2/.venv/bin:${PATH}"
 
 RUN uv pip install --python "$VENV/bin/python" runpod "huggingface_hub[cli]"
