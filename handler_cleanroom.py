@@ -58,7 +58,7 @@ def handler(job):
         if inp.get("image_b64"):
             img = Path("/tmp/in.png")
             img.write_bytes(base64.b64decode(inp["image_b64"]))
-            cmd += ["--images", str(img)]
+            cmd += ["--image", str(img)]
         if bool(inp.get("enhance", True)):
             cmd += ["--enhance-prompt"]
         cmd += [str(a) for a in inp.get("extra_args", [])]
