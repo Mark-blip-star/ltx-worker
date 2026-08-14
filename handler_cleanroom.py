@@ -22,6 +22,8 @@ COMPONENTS = {
     "audio-vae-path": "vae/ltx-2.5-audio-vae-bf16.safetensors",
     "spatial-upsampler-path": "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
 }
+ENHANCER_REPO = "google/gemma-3-12b-it"
+ENHANCER_DIR = Path("/models/enhancer")
 _READY = False
 
 
@@ -34,6 +36,10 @@ def _ensure_weights() -> float:
             cmd = ["hf", "download", REPO, *missing, "--local-dir", str(MODELS)]
             print(f"[cleanroom] downloading {len(missing)} files...", flush=True)
             subprocess.run(cmd, check=True, timeout=3600)
+        if not (ENHANCER_DIR / "config.json").exists():
+            print("[cleanroom] downloading prompt-enhancer gemma...", flush=True)
+            subprocess.run(["hf", "download", ENHANCER_REPO, "--local-dir", str(ENHANCER_DIR)],
+                           check=True, timeout=3600)
         _READY = True
     return round(time.time() - t0, 1)
 
@@ -58,9 +64,9 @@ def handler(job):
         if inp.get("image_b64"):
             img = Path("/tmp/in.png")
             img.write_bytes(base64.b64decode(inp["image_b64"]))
-            cmd += ["--image", str(img)]
+            cmd += ["--image", str(img), "0", "1.0"]
         if bool(inp.get("enhance", True)):
-            cmd += ["--enhance-prompt"]
+            cmd += ["--enhance-prompt", "--prompt-enhancer-gemma-root", str(ENHANCER_DIR)]
         cmd += [str(a) for a in inp.get("extra_args", [])]
 
         t0 = time.time()
