@@ -7,6 +7,8 @@ the runpod SDK supervisor survives and reports our stderr.
 Commands:
   {"cmd": "init"}                       -> {"ok": true, "init": {...}}
   {"cmd": "gen", "input": {...}, "out": "/tmp/out.mp4"} -> {"ok": true, "gen_s": 12.3}
+  {"cmd": "retake", "input": {...}, "src": "/tmp/retake_src.mp4", "out": "/tmp/out.mp4"}
+                                        -> {"ok": true, "gen_s": 9.8}
 """
 import faulthandler
 import json
@@ -35,6 +37,8 @@ COMPONENTS = {
 _PIPE = None
 _PARSER = None
 _TORCH = None
+_RETAKE_PIPE = None
+_RETAKE_PARSER = None
 
 
 def log(msg):
@@ -75,6 +79,27 @@ def job_argv(inp, img_path, out_path):
     if img_path is not None:
         argv += ["--image", str(img_path), "0", "1.0"]
     if bool(inp.get("enhance", True)):
+        argv += ["--enhance-prompt"]
+    argv += [str(a) for a in inp.get("extra_args", [])]
+    return argv
+
+
+def retake_argv(inp, src_path, out_path):
+    argv = []
+    for flag, rel in COMPONENTS.items():
+        if flag == "spatial-upsampler-path":
+            continue  # retake is single-stage at source resolution; video_editing parser has no upsampler flag
+        argv += [f"--{flag}", str(MODELS / rel)]
+    argv += ["--prompt-enhancer-gemma-root", str(ENHANCER_DIR),
+             "--prompt", str(inp.get("prompt", "")),
+             "--seed", str(int(inp.get("seed", 42))),
+             "--video-path", str(src_path),
+             "--start-time", str(float(inp.get("start_time", 0.0))),
+             "--end-time", str(float(inp.get("end_time", 0.0))),
+             "--output-path", str(out_path)]
+    if QUANTIZATION:
+        argv += ["--quantization", QUANTIZATION]
+    if bool(inp.get("enhance", False)):  # upstream retake default: the window prompt is used verbatim
         argv += ["--enhance-prompt"]
     argv += [str(a) for a in inp.get("extra_args", [])]
     return argv
@@ -193,6 +218,90 @@ def do_gen(inp, out_path):
     return {"gen_s": round(time.time() - t0, 1)}
 
 
+def _get_retake_pipe(args):
+    """RetakePipeline that shares the gen pipeline's resident blocks. Both pipelines build
+    their blocks from identical construction args, and blocks only load weights on __call__
+    (__init__ stores config), so the duplicates made here are free — swapping in the gen
+    pipeline's instances makes the residency cache hit by id() with zero extra VRAM. Retake
+    keeps only its own audio_conditioner (gen has none); that encoder builds/frees per call.
+    """
+    global _RETAKE_PIPE
+    if _RETAKE_PIPE is None:
+        from ltx_pipelines import retake as R  # noqa: PLC0415
+
+        p = R.RetakePipeline(
+            model_paths=args.model_paths,
+            loras=tuple(args.lora) if args.lora else (),
+            quantization=args.quantization,
+            distilled=True,
+            compilation_config=args.compile,
+            offload_mode=args.offload_mode,
+            prompt_enhancer_gemma_root=args.prompt_enhancer_gemma_root,
+            diffvae_optimization=args.diffvae_optimization,
+        )
+        p.prompt_encoder = _PIPE.prompt_encoder
+        p.image_conditioner = _PIPE.image_conditioner
+        p.stage = _PIPE.stage
+        p.video_decoder = _PIPE.video_decoder
+        p.audio_decoder = _PIPE.audio_decoder
+        _RETAKE_PIPE = p
+        log("retake pipeline ready (blocks shared with gen)")
+    return _RETAKE_PIPE
+
+
+def do_retake(inp, src_path, out_path):
+    global _RETAKE_PARSER
+    from ltx_core.model.video_vae import AUTO_TILING, get_video_chunks_number  # noqa: PLC0415
+    from ltx_core.types import SpatioTemporalScaleFactors  # noqa: PLC0415
+    from ltx_pipelines.utils.args import video_editing_arg_parser  # noqa: PLC0415
+    from ltx_pipelines.utils.constants import detect_params  # noqa: PLC0415
+    from ltx_pipelines.utils.media_io import (  # noqa: PLC0415
+        encode_video, get_videostream_metadata, resolve_hdr_color_space, vae_dtype_for_hdr)
+
+    out = Path(out_path)
+    out.unlink(missing_ok=True)
+    if _RETAKE_PARSER is None:
+        _RETAKE_PARSER = video_editing_arg_parser(distilled=True)
+    args = _RETAKE_PARSER.parse_args(retake_argv(inp, src_path, out))
+    if args.start_time >= args.end_time:
+        raise ValueError(f"start_time ({args.start_time}) must be less than end_time ({args.end_time})")
+    # upstream main()'s CLI-stage source validation, verbatim
+    video_scale = SpatioTemporalScaleFactors.default()
+    src = get_videostream_metadata(args.video_path)
+    if (src.frames - 1) % video_scale.time != 0:
+        snapped = ((src.frames - 1) // video_scale.time) * video_scale.time + 1
+        raise ValueError(f"source frames must satisfy 8k+1; got {src.frames} (nearest {snapped})")
+    if src.width % 32 != 0 or src.height % 32 != 0:
+        raise ValueError(f"source dims must be multiples of 32; got {src.width}x{src.height}")
+    pipe = _get_retake_pipe(args)
+    t0 = time.time()
+    with _TORCH.inference_mode():
+        params = detect_params(args.model_paths.transformer())
+        hdr = resolve_hdr_color_space(video_paths=[args.video_path], hdr=args.hdr)
+        vae_dtype = vae_dtype_for_hdr(hdr, _TORCH.bfloat16)
+        video_iter, audio, tiling_config = pipe(
+            video_path=args.video_path,
+            prompt=args.prompt,
+            start_time=args.start_time,
+            end_time=args.end_time,
+            seed=args.seed,
+            enhance_prompt=args.enhance_prompt,
+            enhance_static_cache=args.enhance_static_cache,
+            regenerate_video=bool(inp.get("regenerate_video", True)),
+            regenerate_audio=bool(inp.get("regenerate_audio", True)),
+            video_guider_params=params.video_guider_params,
+            audio_guider_params=params.audio_guider_params,
+            vae_dtype=vae_dtype,
+            color_space=hdr,
+            tiling_config=AUTO_TILING,
+            max_batch_size=args.max_batch_size,
+        )
+        encode_video(video=video_iter, fps=int(src.fps), audio=audio, output_path=out,
+                     video_chunks_number=get_video_chunks_number(src.frames, tiling_config),
+                     color_space=hdr)
+    return {"gen_s": round(time.time() - t0, 1)}
+
+
 def main():
     log(f"child up, pid={os.getpid()}")
     for line in sys.stdin:
@@ -206,6 +315,10 @@ def main():
                 reply({"ok": True, "init": do_init()})
             elif cmd == "gen":
                 r = do_gen(msg.get("input") or {}, msg.get("out") or "/tmp/out.mp4")
+                reply({"ok": True, **r})
+            elif cmd == "retake":
+                r = do_retake(msg.get("input") or {}, msg.get("src") or "/tmp/retake_src.mp4",
+                              msg.get("out") or "/tmp/out.mp4")
                 reply({"ok": True, **r})
             elif cmd == "ping":
                 reply({"ok": True, "pong": True})

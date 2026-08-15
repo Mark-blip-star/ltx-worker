@@ -18,9 +18,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
 
-# Vanilla upstream at a pinned commit (recorded for provenance in /BUILD_COMMIT).
-RUN git clone --depth 1 https://github.com/Lightricks/LTX-2 /app/LTX-2 && \
-    cd /app/LTX-2 && git rev-parse HEAD | tee /BUILD_COMMIT && \
+# Vanilla upstream PINNED to the exact commit prod v9.7 runs (was: unpinned clone — every
+# build gambled on upstream master). Recorded in /BUILD_COMMIT and reported per job.
+ARG LTX2_COMMIT=fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca
+RUN mkdir -p /app/LTX-2 && cd /app/LTX-2 && git init -q && \
+    git remote add origin https://github.com/Lightricks/LTX-2 && \
+    git fetch -q --depth 1 origin ${LTX2_COMMIT} && git checkout -q FETCH_HEAD && \
+    git rev-parse HEAD | tee /BUILD_COMMIT && \
     uv python install 3.12 && uv sync --python 3.12 && uv cache clean
 ENV VENV=/app/LTX-2/.venv PATH="/app/LTX-2/.venv/bin:${PATH}"
 

@@ -87,14 +87,25 @@ def handler(job):
                 return {"error": "init failed", **{k: r[k] for k in ("error", "trace", "stderr_tail") if r.get(k)}}
             _STATE["init"] = r.get("init")
 
-        gen_inp = dict(inp)
-        if inp.get("image_b64"):
-            img = Path("/tmp/in.png")
-            img.write_bytes(base64.b64decode(inp["image_b64"]))
-            gen_inp.pop("image_b64", None)
-            gen_inp["image_path"] = str(img)
         out = "/tmp/out.mp4"
-        r = _rpc({"cmd": "gen", "input": gen_inp, "out": out}, timeout=1800)
+        task = str(inp.get("task") or "gen").lower()
+        if task == "retake":
+            if not inp.get("video_b64"):
+                return {"error": "retake requires video_b64 (source video)"}
+            src = Path("/tmp/retake_src.mp4")
+            src.write_bytes(base64.b64decode(inp["video_b64"]))
+            r_inp = dict(inp)
+            r_inp.pop("video_b64", None)
+            r_inp.pop("task", None)
+            r = _rpc({"cmd": "retake", "input": r_inp, "src": str(src), "out": out}, timeout=1800)
+        else:
+            gen_inp = dict(inp)
+            if inp.get("image_b64"):
+                img = Path("/tmp/in.png")
+                img.write_bytes(base64.b64decode(inp["image_b64"]))
+                gen_inp.pop("image_b64", None)
+                gen_inp["image_path"] = str(img)
+            r = _rpc({"cmd": "gen", "input": gen_inp, "out": out}, timeout=1800)
         if not r.get("ok"):
             return {"error": r.get("error", "gen failed"),
                     **{k: r[k] for k in ("trace", "stderr_tail") if r.get(k)},
