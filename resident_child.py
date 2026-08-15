@@ -73,6 +73,48 @@ def job_argv(inp, img_path, out_path):
     return argv
 
 
+def _make_resident():
+    """v9.4 module residency (quality-neutral): upstream blocks rebuild every model on every
+    call and dispose it after (blocks.py: "Blocks build a model on each __call__"). We memoize
+    the heavy `_build_*` methods per block instance and no-op `dispose` ONLY on those cached
+    modules, so gpu_model()'s exit hook leaves them resident. Light per-call builds that we do
+    not memoize (decoders) keep the vendor build/free cycle — no VRAM leaks. Bonus: a stable
+    VRAM map gives natten's DiffVAE tile planner honest free-memory numbers.
+    """
+    import inspect  # noqa: PLC0415
+
+    import ltx_pipelines.utils.blocks as B  # noqa: PLC0415
+
+    names = {"_build_transformer", "_build_text_encoder", "_build_enhancer_text_encoder",
+             "_build_embeddings_processor", "_build_encoder"}
+    cache = {}
+
+    def residentize(cls, name):
+        orig = getattr(cls, name)
+
+        def wrapper(self, *a, **kw):
+            key = (id(self), name)
+            if key not in cache:
+                m = orig(self, *a, **kw)
+                try:
+                    m.dispose = lambda: None  # gpu_model() exit must not free a resident module
+                except AttributeError:
+                    pass
+                cache[key] = m
+                log(f"resident: built+cached {cls.__name__}.{name}")
+            return cache[key]
+
+        setattr(cls, name, wrapper)
+
+    patched = []
+    for cname, cls in vars(B).items():
+        if inspect.isclass(cls):
+            for n in names & set(vars(cls)):
+                residentize(cls, n)
+                patched.append(f"{cname}.{n}")
+    log(f"residency patched: {patched}")
+
+
 def do_init():
     global _PIPE, _PARSER, _TORCH
     t0 = time.time()
@@ -82,6 +124,7 @@ def do_init():
     import torch  # noqa: PLC0415
     from ltx_pipelines import distilled as D  # noqa: PLC0415
     _TORCH = torch
+    _make_resident()
     log("imports done, building parser...")
     # resolve_cli_params/detect_checkpoint_path read sys.argv of THIS process (that is how the
     # vanilla CLI finds the checkpoint) — feed them the same argv we parse explicitly. Without
