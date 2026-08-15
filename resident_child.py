@@ -21,8 +21,11 @@ faulthandler.enable(file=sys.stderr)  # native crashes (SIGSEGV/SIGABRT) dump py
 REPO = os.environ.get("LTX25_WEIGHTS_REPO", "Markooooo/ltx25-prod")  # our mirror (pin-able); env-override for dark/RD
 MODELS = Path(os.environ.get("LTX25_MODELS_DIR", "/models/ltx-2.5"))
 ENHANCER_DIR = MODELS / "enhancer"  # mirrored into the same repo under enhancer/
+QUANTIZATION = os.environ.get("LTX25_QUANTIZATION", "").strip()  # "", fp8-cast, nvfp4-prequant, ...
 COMPONENTS = {
-    "transformer-path": "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
+    "transformer-path": os.environ.get(
+        "LTX25_TRANSFORMER_FILE",
+        "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors"),
     "text-encoder-path": "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
     "video-vae-path": "vae/ltx-2.5-video-vae-bf16.safetensors",
     "audio-vae-path": "vae/ltx-2.5-audio-vae-bf16.safetensors",
@@ -67,6 +70,8 @@ def job_argv(inp, img_path, out_path):
              "--frame-rate", str(int(inp.get("fps", 24))),
              "--num-frames", str(int(inp.get("frames", 121))),
              "--output-path", str(out_path)]
+    if QUANTIZATION:
+        argv += ["--quantization", QUANTIZATION]
     if img_path is not None:
         argv += ["--image", str(img_path), "0", "1.0"]
     if bool(inp.get("enhance", True)):
