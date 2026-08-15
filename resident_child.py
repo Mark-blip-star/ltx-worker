@@ -15,10 +15,9 @@ import sys
 import time
 from pathlib import Path
 
-REPO = "Lightricks/LTX-2.5"
+REPO = os.environ.get("LTX25_WEIGHTS_REPO", "Markooooo/ltx25-prod")  # our mirror (pin-able); env-override for dark/RD
 MODELS = Path(os.environ.get("LTX25_MODELS_DIR", "/models/ltx-2.5"))
-ENHANCER_REPO = "google/gemma-3-12b-it"
-ENHANCER_DIR = Path("/models/enhancer")
+ENHANCER_DIR = MODELS / "enhancer"  # mirrored into the same repo under enhancer/
 COMPONENTS = {
     "transformer-path": "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
     "text-encoder-path": "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
@@ -48,8 +47,8 @@ def ensure_weights():
         subprocess.run(["hf", "download", REPO, *missing, "--local-dir", str(MODELS)],
                        check=True, timeout=3600)
     if not (ENHANCER_DIR / "config.json").exists():
-        log("downloading prompt-enhancer gemma...")
-        subprocess.run(["hf", "download", ENHANCER_REPO, "--local-dir", str(ENHANCER_DIR)],
+        log("downloading prompt-enhancer gemma (mirror)...")
+        subprocess.run(["hf", "download", REPO, "--include", "enhancer/*", "--local-dir", str(MODELS)],
                        check=True, timeout=3600)
 
 
