@@ -8,12 +8,15 @@ Commands:
   {"cmd": "init"}                       -> {"ok": true, "init": {...}}
   {"cmd": "gen", "input": {...}, "out": "/tmp/out.mp4"} -> {"ok": true, "gen_s": 12.3}
 """
+import faulthandler
 import json
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+faulthandler.enable(file=sys.stderr)  # native crashes (SIGSEGV/SIGABRT) dump py-stacks to stderr
 
 REPO = os.environ.get("LTX25_WEIGHTS_REPO", "Markooooo/ltx25-prod")  # our mirror (pin-able); env-override for dark/RD
 MODELS = Path(os.environ.get("LTX25_MODELS_DIR", "/models/ltx-2.5"))
@@ -124,6 +127,17 @@ def do_init():
     from ltx_pipelines import distilled as D  # noqa: PLC0415
     _TORCH = torch
     _make_resident()
+    try:
+        cap = torch.cuda.get_device_capability()
+        name = torch.cuda.get_device_name()
+        log(f"GPU: {name} | compute capability sm_{cap[0]}{cap[1]}")
+        try:
+            import natten  # noqa: PLC0415
+            log(f"natten {getattr(natten, '__version__', '?')} importable")
+        except Exception as ne:  # noqa: BLE001
+            log(f"natten import failed: {ne!r}")
+    except Exception as de:  # noqa: BLE001
+        log(f"device probe failed: {de!r}")
     log("imports done, building parser...")
     # resolve_cli_params/detect_checkpoint_path read sys.argv of THIS process (that is how the
     # vanilla CLI finds the checkpoint) — feed them the same argv we parse explicitly. Without
