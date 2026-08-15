@@ -24,7 +24,9 @@ RUN git clone --depth 1 https://github.com/Lightricks/LTX-2 /app/LTX-2 && \
     uv python install 3.12 && uv sync --python 3.12 && uv cache clean
 ENV VENV=/app/LTX-2/.venv PATH="/app/LTX-2/.venv/bin:${PATH}"
 
-RUN uv pip install --python "$VENV/bin/python" runpod "huggingface_hub[cli]"
+RUN uv pip install --python "$VENV/bin/python" runpod "huggingface_hub[cli]" && \
+    (uv pip install --python "$VENV/bin/python" natten -f https://whl.natten.org || \
+     echo "WARN: no natten wheel matched — DiffVAE stays on fallback")
 
 COPY handler_cleanroom.py /app/handler_cleanroom.py
 COPY handler_resident.py /app/handler_resident.py
