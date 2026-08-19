@@ -50,7 +50,48 @@ def reply(obj):
     sys.stdout.flush()
 
 
+
+def _seeded_models_root():
+    """RunPod Cached Models seeds the pinned repo onto the host disk before the container
+    starts, but the mount layout is undocumented (2.3 hosts showed both a repo dir at the
+    volume root and an HF hub tree). Probe the known shapes and accept only a directory
+    holding EVERY component plus the enhancer — anything less falls through to the
+    download path unchanged."""
+    dirname = "models--" + REPO.replace("/", "--")
+    candidates = []
+    for root in (Path("/runpod-volume"), Path("/runpod-volume/huggingface-cache/hub")):
+        d = root / dirname
+        try:
+            ref = d / "refs" / "main"
+            if ref.is_file():
+                candidates.append(d / "snapshots" / ref.read_text().strip())
+            snaps = d / "snapshots"
+            if snaps.is_dir():
+                candidates += sorted(snaps.iterdir(), reverse=True)
+        except OSError:
+            pass
+        candidates.append(d)
+    for cand in candidates:
+        try:
+            if all((cand / rel).is_file() for rel in COMPONENTS.values()) and (
+                    cand / "enhancer" / "config.json").is_file():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
 def ensure_weights():
+    global MODELS, ENHANCER_DIR
+    # An explicit LTX25_MODELS_DIR keeps full manual control (RD override); otherwise a
+    # complete seeded copy wins and the virgin worker skips its ~30s download.
+    if "LTX25_MODELS_DIR" not in os.environ:
+        seeded = _seeded_models_root()
+        if seeded is not None:
+            MODELS = seeded
+            ENHANCER_DIR = MODELS / "enhancer"
+            log(f"weights: complete seeded copy at {MODELS} — download skipped")
+            return "seeded"
     missing = [rel for rel in COMPONENTS.values() if not (MODELS / rel).exists()]
     if missing:
         log(f"downloading {len(missing)} component files...")
@@ -60,6 +101,8 @@ def ensure_weights():
         log("downloading prompt-enhancer gemma (mirror)...")
         subprocess.run(["hf", "download", REPO, "--include", "enhancer/*", "--local-dir", str(MODELS)],
                        check=True, timeout=3600)
+        return "downloaded"
+    return "downloaded" if missing else "cached"
 
 
 def job_argv(inp, img_path, out_path):
@@ -150,7 +193,7 @@ def _make_resident():
 def do_init():
     global _PIPE, _PARSER, _TORCH
     t0 = time.time()
-    ensure_weights()
+    weights_src = ensure_weights()
     t_dl = time.time()
     log("importing torch + ltx stack...")
     import torch  # noqa: PLC0415
@@ -189,7 +232,8 @@ def do_init():
         diffvae_optimization=args.diffvae_optimization,
     )
     log("resident pipeline READY")
-    return {"download_s": round(t_dl - t0, 1), "build_s": round(time.time() - t_dl, 1)}
+    return {"download_s": round(t_dl - t0, 1), "build_s": round(time.time() - t_dl, 1),
+            "weights_src": weights_src, "models_dir": str(MODELS)}
 
 
 def do_gen(inp, out_path):
@@ -328,7 +372,15 @@ def main():
             reply({"ok": False, "error": f"argparse exit {exc.code}"})
         except Exception as exc:  # noqa: BLE001
             import traceback
-            reply({"ok": False, "error": str(exc)[:300], "trace": traceback.format_exc()[-1500:]})
+            err = {"ok": False, "error": str(exc)[:300], "trace": traceback.format_exc()[-1500:]}
+            try:
+                if _TORCH is not None:
+                    free_b, total_b = _TORCH.cuda.mem_get_info()
+                    err["vram_free_gib"] = round(free_b / 2**30, 1)
+                    err["vram_total_gib"] = round(total_b / 2**30, 1)
+            except Exception:  # noqa: BLE001
+                pass
+            reply(err)
 
 
 if __name__ == "__main__":

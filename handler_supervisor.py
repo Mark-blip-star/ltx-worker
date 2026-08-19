@@ -108,7 +108,7 @@ def handler(job):
             r = _rpc({"cmd": "gen", "input": gen_inp, "out": out}, timeout=1800)
         if not r.get("ok"):
             return {"error": r.get("error", "gen failed"),
-                    **{k: r[k] for k in ("trace", "stderr_tail") if r.get(k)},
+                    **{k: r[k] for k in ("trace", "stderr_tail", "vram_free_gib", "vram_total_gib") if r.get(k)},
                     "init": _STATE["init"]}
         data = Path(out).read_bytes()
         return {"video_b64": base64.b64encode(data).decode(),
