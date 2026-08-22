@@ -24,6 +24,18 @@ REPO = os.environ.get("LTX25_WEIGHTS_REPO", "Markooooo/ltx25-prod")  # our mirro
 MODELS = Path(os.environ.get("LTX25_MODELS_DIR", "/models/ltx-2.5"))
 ENHANCER_DIR = MODELS / "enhancer"  # mirrored into the same repo under enhancer/
 QUANTIZATION = os.environ.get("LTX25_QUANTIZATION", "").strip()  # "", fp8-cast, nvfp4-prequant, ...
+
+
+def _flag(name, default="1"):
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+# v9.10 speed knobs (all quality-neutral; defaults = the measured-safe set, compile paths opt-in)
+ENHANCE_STATIC_CACHE = _flag("LTX25_ENHANCE_STATIC_CACHE")  # HF static KV cache for the Gemma enhancer
+RESIDENT_DECODERS = _flag("LTX25_RESIDENT_DECODERS")  # keep VAE/upsampler/audio decoders on GPU between jobs
+WARMUP = _flag("LTX25_WARMUP")  # one prod-shape clip at init so the first user job pays no shape warm-up
+DIFFVAE_MODE = os.environ.get("LTX25_DIFFVAE_MODE", "").strip()  # "", chunked_compile, combined_compile
+COMPILE = os.environ.get("LTX25_COMPILE", "").strip()  # "", "1" (defaults) or "k=v k=v" CompilationConfig overrides
 COMPONENTS = {
     "transformer-path": os.environ.get(
         "LTX25_TRANSFORMER_FILE",
@@ -123,7 +135,19 @@ def job_argv(inp, img_path, out_path):
         argv += ["--image", str(img_path), "0", "1.0"]
     if bool(inp.get("enhance", True)):
         argv += ["--enhance-prompt"]
+        if ENHANCE_STATIC_CACHE:
+            argv += ["--enhance-static-cache"]
+    argv += _perf_argv()
     argv += [str(a) for a in inp.get("extra_args", [])]
+    return argv
+
+
+def _perf_argv():
+    argv = []
+    if DIFFVAE_MODE:
+        argv += ["--diffvae-optimization", DIFFVAE_MODE]
+    if COMPILE:
+        argv += ["--compile"] + ([] if COMPILE in ("1", "true", "on") else COMPILE.split())
     return argv
 
 
@@ -144,6 +168,9 @@ def retake_argv(inp, src_path, out_path):
         argv += ["--quantization", QUANTIZATION]
     if bool(inp.get("enhance", False)):  # upstream retake default: the window prompt is used verbatim
         argv += ["--enhance-prompt"]
+        if ENHANCE_STATIC_CACHE:
+            argv += ["--enhance-static-cache"]
+    argv += _perf_argv()
     argv += [str(a) for a in inp.get("extra_args", [])]
     return argv
 
@@ -188,6 +215,89 @@ def _make_resident():
                 residentize(cls, n)
                 patched.append(f"{cname}.{n}")
     log(f"residency patched: {patched}")
+    if RESIDENT_DECODERS:
+        _make_builders_resident()
+
+
+_BUILD_CACHE = {}
+
+
+def _make_builders_resident():
+    """v9.10: in this upstream pin the VAE encoder/upsampler, video decoder and audio decoder+vocoder
+    are built inline via ``Builder.build()`` inside the blocks' __call__ (no ``_build_*`` hook), so
+    every job re-read ~3 GiB of weights from disk and re-materialized the modules. Memoize
+    ``SingleGPUModelBuilder.build`` per builder instance (the blocks own their builders for the
+    pipeline's lifetime) and neutralize ``dispose`` on the cached module so ``gpu_model()`` leaves
+    it resident. The builder itself is pinned in the cache entry so its id() can never be recycled
+    onto a different builder. A different device/dtype request (HDR fp32 decode) falls through to a
+    real rebuild and evicts the stale entry — correctness over speed on that path.
+    """
+    from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder  # noqa: PLC0415
+
+    orig = SingleGPUModelBuilder.build
+
+    def build(self, device=None, dtype=None, **kw):
+        key = id(self)
+        want = (str(device), str(dtype))
+        hit = _BUILD_CACHE.get(key)
+        if hit is not None and hit[0] == want:
+            return hit[1]
+        if hit is not None:
+            _BUILD_CACHE.pop(key)
+        m = orig(self, device=device, dtype=dtype, **kw)
+        try:
+            m.dispose = lambda: None
+        except AttributeError:
+            pass
+        _BUILD_CACHE[key] = (want, m, self)
+        log(f"resident: builder-cached {type(m).__name__} ({len(_BUILD_CACHE)} modules resident)")
+        return m
+
+    SingleGPUModelBuilder.build = build
+    log("residency: SingleGPUModelBuilder.build memoized (decoders/upsampler stay on GPU)")
+
+
+_TIMINGS = {}
+
+
+def _timed(cls, name, label):
+    orig = getattr(cls, name)
+
+    def wrapper(self, *a, **kw):
+        t0 = time.time()
+        out = orig(self, *a, **kw)
+        if hasattr(out, "__next__"):  # iterator: count until exhausted (video decoder yields chunks)
+            def it():
+                try:
+                    yield from out
+                finally:
+                    _TIMINGS[label] = round(_TIMINGS.get(label, 0.0) + time.time() - t0, 2)
+            return it()
+        _TIMINGS[label] = round(_TIMINGS.get(label, 0.0) + time.time() - t0, 2)
+        return out
+
+    setattr(cls, name, wrapper)
+
+
+def _install_timers():
+    """Per-phase wall clock in the job output (enhance / upsample / decode / audio / mp4) so the
+    speed levers can be judged from prod outputs, not guessed."""
+    import ltx_pipelines.utils.blocks as B  # noqa: PLC0415
+    from ltx_core.text_encoders.gemma.encoders import base_encoder as E  # noqa: PLC0415
+
+    _timed(E.LTXGemmaTextEncoder, "_enhance", "enhance_s")
+    for cname, label in (("VideoUpsampler", "upsample_s"), ("VideoDecoder", "decode_s"),
+                         ("AudioDecoder", "audio_s"), ("PromptEncoder", "encode_s")):
+        cls = getattr(B, cname, None)
+        if cls is not None and "__call__" in vars(cls):
+            _timed(cls, "__call__", label)
+    log("phase timers installed")
+
+
+def _take_timings():
+    t = dict(_TIMINGS)
+    _TIMINGS.clear()
+    return t
 
 
 def do_init():
@@ -200,6 +310,10 @@ def do_init():
     from ltx_pipelines import distilled as D  # noqa: PLC0415
     _TORCH = torch
     _make_resident()
+    try:
+        _install_timers()
+    except Exception as te:  # noqa: BLE001
+        log(f"phase timers unavailable: {te!r}")
     try:
         cap = torch.cuda.get_device_capability()
         name = torch.cuda.get_device_name()
@@ -232,8 +346,26 @@ def do_init():
         diffvae_optimization=args.diffvae_optimization,
     )
     log("resident pipeline READY")
-    return {"download_s": round(t_dl - t0, 1), "build_s": round(time.time() - t_dl, 1),
-            "weights_src": weights_src, "models_dir": str(MODELS)}
+    info = {"download_s": round(t_dl - t0, 1), "build_s": round(time.time() - t_dl, 1),
+            "weights_src": weights_src, "models_dir": str(MODELS),
+            "knobs": {"static_cache": ENHANCE_STATIC_CACHE, "resident_decoders": RESIDENT_DECODERS,
+                      "warmup": WARMUP, "diffvae_mode": DIFFVAE_MODE or "default", "compile": COMPILE or "off"}}
+    if WARMUP:
+        # Prod shape (1280x704x121f, enhancer on) — pays the per-shape warm-up, the enhancer's
+        # static-cache compile and any --compile/chunked_compile builds once per worker, not on
+        # the first user job (measured +6s on prod 22.08 after 17f-only keepalives).
+        tw = time.time()
+        try:
+            r = do_gen({"prompt": "A red kite rises over a windy beach at sunset. Audio: wind, gentle waves.",
+                        "seed": 1, "width": 1280, "height": 704, "fps": 24, "frames": 121,
+                        "enhance": True}, "/tmp/warm.mp4")
+            info["warmup"] = {"ok": True, "gen_s": r.get("gen_s"), "timings": r.get("timings"),
+                              "total_s": round(time.time() - tw, 1)}
+        except Exception as we:  # noqa: BLE001
+            info["warmup"] = {"ok": False, "error": str(we)[:200], "total_s": round(time.time() - tw, 1)}
+        log(f"warmup: {info['warmup']}")
+        Path("/tmp/warm.mp4").unlink(missing_ok=True)
+    return info
 
 
 def do_gen(inp, out_path):
@@ -256,10 +388,12 @@ def do_gen(inp, out_path):
             enhance_prompt=args.enhance_prompt, enhance_static_cache=args.enhance_static_cache,
             tiling_config=D.AUTO_TILING, generated_keyframes=args.num_generated_keyframes,
         )
+        te = time.time()
         D.encode_video(video=video, fps=args.frame_rate, audio=audio, output_path=out,
                        video_chunks_number=D.get_video_chunks_number(num_frames, tiling_config),
                        color_space=hdr)
-    return {"gen_s": round(time.time() - t0, 1)}
+        _TIMINGS["mp4_s"] = round(time.time() - te, 2)  # includes the decode chunks it pulls through
+    return {"gen_s": round(time.time() - t0, 1), "timings": _take_timings()}
 
 
 def _get_retake_pipe(args):
@@ -343,7 +477,7 @@ def do_retake(inp, src_path, out_path):
         encode_video(video=video_iter, fps=int(src.fps), audio=audio, output_path=out,
                      video_chunks_number=get_video_chunks_number(src.frames, tiling_config),
                      color_space=hdr)
-    return {"gen_s": round(time.time() - t0, 1)}
+    return {"gen_s": round(time.time() - t0, 1), "timings": _take_timings()}
 
 
 def main():

@@ -112,7 +112,7 @@ def handler(job):
                     "init": _STATE["init"]}
         data = Path(out).read_bytes()
         return {"video_b64": base64.b64encode(data).decode(),
-                "gen_seconds": r.get("gen_s"), "init": _STATE["init"],
+                "gen_seconds": r.get("gen_s"), "timings": r.get("timings"), "init": _STATE["init"],
                 "build_commit": Path("/BUILD_COMMIT").read_text().strip()[:12] if Path("/BUILD_COMMIT").exists() else None}
     except Exception as exc:  # noqa: BLE001
         import traceback
