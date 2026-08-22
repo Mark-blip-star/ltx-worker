@@ -30,11 +30,18 @@ def _flag(name, default="1"):
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
-# v9.10 speed knobs (all quality-neutral; defaults = the measured-safe set, compile paths opt-in)
-ENHANCE_STATIC_CACHE = _flag("LTX25_ENHANCE_STATIC_CACHE")  # HF static KV cache for the Gemma enhancer
-RESIDENT_DECODERS = _flag("LTX25_RESIDENT_DECODERS")  # keep VAE/upsampler/audio decoders on GPU between jobs
-WARMUP = _flag("LTX25_WARMUP")  # one prod-shape clip at init so the first user job pays no shape warm-up
-DIFFVAE_MODE = os.environ.get("LTX25_DIFFVAE_MODE", "").strip()  # "", chunked_compile, combined_compile
+# v9.10/v9.11 speed knobs; defaults = the lab-verified prod set (22-23.08, H200, 720p/1080p/vertical):
+#  - resident decoders + prod-shape warm-up: frames bit-identical to v9.9, no +6s first-job penalty
+#  - DiffVAE chunked_compile: decode 7.4->5.5s (720p) / 18.4->13.3s (1080p), PSNR 46 dB vs eager
+#  - enhancer static KV cache: OFF — device-side assert on the Gemma-3 enhancer (sliding-window layers)
+#  - DiT --compile: OFF — faster (-0.8s/-3.7s) but the same seed renders a different clip (PSNR 17-22 dB)
+#  - combined_compile: OFF — recompiles per shape, 1080p got slower
+ENHANCE_STATIC_CACHE = _flag("LTX25_ENHANCE_STATIC_CACHE", "0")
+RESIDENT_DECODERS = _flag("LTX25_RESIDENT_DECODERS")
+WARMUP = _flag("LTX25_WARMUP")
+DIFFVAE_MODE = os.environ.get("LTX25_DIFFVAE_MODE", "chunked_compile").strip()  # "default" = upstream chunked_eager
+if DIFFVAE_MODE == "default":
+    DIFFVAE_MODE = ""
 COMPILE = os.environ.get("LTX25_COMPILE", "").strip()  # "", "1" (defaults) or "k=v k=v" CompilationConfig overrides
 COMPONENTS = {
     "transformer-path": os.environ.get(
@@ -362,7 +369,11 @@ def do_init():
             info["warmup"] = {"ok": True, "gen_s": r.get("gen_s"), "timings": r.get("timings"),
                               "total_s": round(time.time() - tw, 1)}
         except Exception as we:  # noqa: BLE001
-            info["warmup"] = {"ok": False, "error": str(we)[:200], "total_s": round(time.time() - tw, 1)}
+            import traceback
+            info["warmup"] = {"ok": False, "error": str(we)[:200], "trace": traceback.format_exc()[-1200:],
+                              "total_s": round(time.time() - tw, 1)}
+            if _cuda_context_poisoned(we):
+                raise
         log(f"warmup: {info['warmup']}")
         Path("/tmp/warm.mp4").unlink(missing_ok=True)
     return info
@@ -514,7 +525,22 @@ def main():
                     err["vram_total_gib"] = round(total_b / 2**30, 1)
             except Exception:  # noqa: BLE001
                 pass
+            if _cuda_context_poisoned(exc):
+                # A device-side assert / illegal access leaves every later kernel failing in this
+                # process (seen 22.08: one bad warm-up, then each job died at torch.Generator).
+                # Die now; the supervisor restarts a clean child on the next job.
+                err["child_restart"] = True
+                reply(err)
+                log("CUDA context poisoned — exiting so the supervisor restarts the child")
+                sys.stderr.flush()
+                os._exit(3)
             reply(err)
+
+
+def _cuda_context_poisoned(exc):
+    msg = str(exc)
+    return any(s in msg for s in ("device-side assert", "illegal memory access", "CUDA error",
+                                  "unspecified launch failure", "CUBLAS_STATUS_EXECUTION_FAILED"))
 
 
 if __name__ == "__main__":

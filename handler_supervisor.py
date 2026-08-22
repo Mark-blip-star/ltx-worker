@@ -84,7 +84,8 @@ def handler(job):
         if _STATE["init"] is None:
             r = _rpc({"cmd": "init"}, timeout=3600)
             if not r.get("ok"):
-                return {"error": "init failed", **{k: r[k] for k in ("error", "trace", "stderr_tail") if r.get(k)}}
+                return {"error": "init failed", **{k: r[k] for k in ("error", "trace") if r.get(k)},
+                        "stderr_tail": r.get("stderr_tail") or _stderr_tail(1500)}
             _STATE["init"] = r.get("init")
 
         out = "/tmp/out.mp4"
@@ -108,7 +109,8 @@ def handler(job):
             r = _rpc({"cmd": "gen", "input": gen_inp, "out": out}, timeout=1800)
         if not r.get("ok"):
             return {"error": r.get("error", "gen failed"),
-                    **{k: r[k] for k in ("trace", "stderr_tail", "vram_free_gib", "vram_total_gib") if r.get(k)},
+                    **{k: r[k] for k in ("trace", "vram_free_gib", "vram_total_gib", "child_restart") if r.get(k)},
+                    "stderr_tail": r.get("stderr_tail") or _stderr_tail(1500),
                     "init": _STATE["init"]}
         data = Path(out).read_bytes()
         return {"video_b64": base64.b64encode(data).decode(),
