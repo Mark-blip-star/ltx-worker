@@ -37,6 +37,9 @@ def _flag(name, default="1"):
 #  - DiT --compile: OFF — faster (-0.8s/-3.7s) but the same seed renders a different clip (PSNR 17-22 dB)
 #  - combined_compile: OFF — recompiles per shape, 1080p got slower
 ENHANCE_STATIC_CACHE = _flag("LTX25_ENHANCE_STATIC_CACHE", "0")
+# v9.12: the prompt is enhanced on the backend (gpt-4o-mini, same upstream instructions), so the
+# worker carries no Gemma-3 enhancer — 23 GB less VRAM and download. enhance:true is ignored.
+ENHANCER = _flag("LTX25_ENHANCER", "0")
 RESIDENT_DECODERS = _flag("LTX25_RESIDENT_DECODERS")
 WARMUP = _flag("LTX25_WARMUP")
 DIFFVAE_MODE = os.environ.get("LTX25_DIFFVAE_MODE", "chunked_compile").strip()  # "default" = upstream chunked_eager
@@ -93,7 +96,7 @@ def _seeded_models_root():
     for cand in candidates:
         try:
             if all((cand / rel).is_file() for rel in COMPONENTS.values()) and (
-                    cand / "enhancer" / "config.json").is_file():
+                    not ENHANCER or (cand / "enhancer" / "config.json").is_file()):
                 return cand
         except OSError:
             continue
@@ -116,7 +119,7 @@ def ensure_weights():
         log(f"downloading {len(missing)} component files...")
         subprocess.run(["hf", "download", REPO, *missing, "--local-dir", str(MODELS)],
                        check=True, timeout=3600)
-    if not (ENHANCER_DIR / "config.json").exists():
+    if ENHANCER and not (ENHANCER_DIR / "config.json").exists():
         log("downloading prompt-enhancer gemma (mirror)...")
         subprocess.run(["hf", "download", REPO, "--include", "enhancer/*", "--local-dir", str(MODELS)],
                        check=True, timeout=3600)
@@ -128,8 +131,8 @@ def job_argv(inp, img_path, out_path):
     argv = []
     for flag, rel in COMPONENTS.items():
         argv += [f"--{flag}", str(MODELS / rel)]
-    argv += ["--prompt-enhancer-gemma-root", str(ENHANCER_DIR),
-             "--prompt", str(inp.get("prompt", "")),
+    argv += _enhancer_root_argv()
+    argv += ["--prompt", str(inp.get("prompt", "")),
              "--seed", str(int(inp.get("seed", 42))),
              "--width", str(int(inp.get("width", 1280))),
              "--height", str(int(inp.get("height", 704))),
@@ -140,13 +143,25 @@ def job_argv(inp, img_path, out_path):
         argv += ["--quantization", QUANTIZATION]
     if img_path is not None:
         argv += ["--image", str(img_path), "0", "1.0"]
-    if bool(inp.get("enhance", True)):
+    if _wants_enhance(inp, default=True):
         argv += ["--enhance-prompt"]
         if ENHANCE_STATIC_CACHE:
             argv += ["--enhance-static-cache"]
     argv += _perf_argv()
     argv += [str(a) for a in inp.get("extra_args", [])]
     return argv
+
+
+def _enhancer_root_argv():
+    return ["--prompt-enhancer-gemma-root", str(ENHANCER_DIR)] if ENHANCER else []
+
+
+def _wants_enhance(inp, default):
+    wanted = bool(inp.get("enhance", default))
+    if wanted and not ENHANCER:
+        log("enhance requested but LTX25_ENHANCER=0 — prompt used as written")
+        return False
+    return wanted
 
 
 def _perf_argv():
@@ -164,8 +179,8 @@ def retake_argv(inp, src_path, out_path):
         if flag == "spatial-upsampler-path":
             continue  # retake is single-stage at source resolution; video_editing parser has no upsampler flag
         argv += [f"--{flag}", str(MODELS / rel)]
-    argv += ["--prompt-enhancer-gemma-root", str(ENHANCER_DIR),
-             "--prompt", str(inp.get("prompt", "")),
+    argv += _enhancer_root_argv()
+    argv += ["--prompt", str(inp.get("prompt", "")),
              "--seed", str(int(inp.get("seed", 42))),
              "--video-path", str(src_path),
              "--start-time", str(float(inp.get("start_time", 0.0))),
@@ -173,7 +188,7 @@ def retake_argv(inp, src_path, out_path):
              "--output-path", str(out_path)]
     if QUANTIZATION:
         argv += ["--quantization", QUANTIZATION]
-    if bool(inp.get("enhance", False)):  # upstream retake default: the window prompt is used verbatim
+    if _wants_enhance(inp, default=False):  # upstream retake default: the window prompt is used verbatim
         argv += ["--enhance-prompt"]
         if ENHANCE_STATIC_CACHE:
             argv += ["--enhance-static-cache"]
@@ -355,7 +370,7 @@ def do_init():
     log("resident pipeline READY")
     info = {"download_s": round(t_dl - t0, 1), "build_s": round(time.time() - t_dl, 1),
             "weights_src": weights_src, "models_dir": str(MODELS),
-            "knobs": {"static_cache": ENHANCE_STATIC_CACHE, "resident_decoders": RESIDENT_DECODERS,
+            "knobs": {"enhancer": ENHANCER, "static_cache": ENHANCE_STATIC_CACHE, "resident_decoders": RESIDENT_DECODERS,
                       "warmup": WARMUP, "diffvae_mode": DIFFVAE_MODE or "default", "compile": COMPILE or "off"}}
     if WARMUP:
         # Prod shape (1280x704x121f, enhancer on) — pays the per-shape warm-up, the enhancer's
@@ -365,7 +380,7 @@ def do_init():
         try:
             r = do_gen({"prompt": "A red kite rises over a windy beach at sunset. Audio: wind, gentle waves.",
                         "seed": 1, "width": 1280, "height": 704, "fps": 24, "frames": 121,
-                        "enhance": True}, "/tmp/warm.mp4")
+                        "enhance": ENHANCER}, "/tmp/warm.mp4")
             info["warmup"] = {"ok": True, "gen_s": r.get("gen_s"), "timings": r.get("timings"),
                               "total_s": round(time.time() - tw, 1)}
         except Exception as we:  # noqa: BLE001
