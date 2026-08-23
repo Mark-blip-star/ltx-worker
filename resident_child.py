@@ -52,7 +52,7 @@ COMPILE = os.environ.get("LTX25_COMPILE", "").strip()  # "", "1" (defaults) or "
 X264_PRESET = os.environ.get("LTX25_X264_PRESET", "auto").strip()
 X264_THREADS = int(os.environ.get("LTX25_X264_THREADS", "16") or 0)  # ffmpeg auto = 1.5 x 96 CPUs here, which stalls
 X264_THREAD_TYPE = os.environ.get("LTX25_X264_THREAD_TYPE", "FRAME").strip().upper()  # FRAME (upstream) | SLICE | AUTO
-X264_MIN_FPS = float(os.environ.get("LTX25_X264_MIN_FPS", "120"))  # 121 frames in <= 1 s
+X264_MIN_FPS = float(os.environ.get("LTX25_X264_MIN_FPS", "60"))  # 121 frames in <= 2 s, hidden behind a 4 s decode
 WARMUP_SHAPES = [s for s in os.environ.get("LTX25_WARMUP_SHAPES", "1280x704,704x1280,1920x1088").split(",") if s.strip()]
 ENCODE_BENCH = _flag("LTX25_ENCODE_BENCH")  # synthetic libx264 bench at init → init.encode_bench
 ENCODE_BENCH_COMBOS = os.environ.get(
