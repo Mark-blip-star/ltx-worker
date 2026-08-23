@@ -49,8 +49,13 @@ COMPILE = os.environ.get("LTX25_COMPILE", "").strip()  # "", "1" (defaults) or "
 # v9.13: mp4 stage. H100/H200 have no NVENC, so the lever is libx264 settings + knowing the CPU budget.
 X264_PRESET = os.environ.get("LTX25_X264_PRESET", "veryfast").strip()
 X264_THREADS = int(os.environ.get("LTX25_X264_THREADS", "0") or 0)  # 0 = ffmpeg auto
+X264_THREAD_TYPE = os.environ.get("LTX25_X264_THREAD_TYPE", "FRAME").strip().upper()  # FRAME (upstream) | SLICE | AUTO
 WARMUP_SHAPES = [s for s in os.environ.get("LTX25_WARMUP_SHAPES", "1280x704").split(",") if s.strip()]
 ENCODE_BENCH = _flag("LTX25_ENCODE_BENCH")  # synthetic libx264 bench at init → init.encode_bench
+# preset:threads:thread_type combos; serverless hosts share CPUs, so the bench shows what THIS host gives
+ENCODE_BENCH_COMBOS = os.environ.get(
+    "LTX25_ENCODE_BENCH_COMBOS",
+    "veryfast:0:FRAME,veryfast:16:FRAME,veryfast:16:SLICE,superfast:16:SLICE,ultrafast:16:SLICE,ultrafast:0:FRAME").split(",")
 COMPONENTS = {
     "transformer-path": os.environ.get(
         "LTX25_TRANSFORMER_FILE",
@@ -426,23 +431,95 @@ def _cpu_budget():
 
 
 def _encode_bench(frames=48, width=1280, height=704):
-    """libx264 alone, no decoder in the loop: fps per preset on this container's CPU budget."""
+    """libx264 alone, no decoder in the loop: fps per preset/threads/thread-type on THIS host."""
     import numpy as np  # noqa: PLC0415
-    from ltx_pipelines.utils.media_io import encode_video  # noqa: PLC0415
 
     rng = np.random.default_rng(0)
     base = rng.integers(0, 256, size=(height, width, 3), dtype=np.uint8)
     frames_np = np.stack([np.roll(base, shift=i * 7, axis=1) for i in range(frames)])
     video = _TORCH.from_numpy(frames_np).float().div_(255.0).to("cuda")  # [F,H,W,C] in [0,1]
     res = {}
-    for preset in ("veryfast", "ultrafast"):
-        t0 = time.time()
-        encode_video(video=video, fps=24, audio=None, output_path="/tmp/bench.mp4", video_chunks_number=1,
-                     preset=preset, thread_count=X264_THREADS)
-        dt = time.time() - t0
-        res[preset] = {"fps": round(frames / dt, 1), "kb": Path("/tmp/bench.mp4").stat().st_size // 1024}
+    for combo in ENCODE_BENCH_COMBOS:
+        try:
+            preset, threads, ttype = combo.strip().split(":")
+            t0 = time.time()
+            encode_video_fast(video=video, fps=24, audio=None, output_path="/tmp/bench.mp4", video_chunks_number=1,
+                              preset=preset, thread_count=int(threads), thread_type=ttype)
+            dt = time.time() - t0
+            res[combo.strip()] = {"fps": round(frames / dt, 1), "kb": Path("/tmp/bench.mp4").stat().st_size // 1024}
+        except Exception as e:  # noqa: BLE001
+            res[combo.strip()] = {"error": str(e)[:120]}
     Path("/tmp/bench.mp4").unlink(missing_ok=True)
     return res
+
+
+def encode_video_fast(video, fps, audio, output_path, video_chunks_number, color_space=None,
+                      preset=None, thread_count=None, thread_type=None, crf=19):
+    """Upstream ``encode_video`` (media_io/encode.py, pin fd4ded7f) with the x264 threading exposed.
+    FRAME threading with ffmpeg's auto thread count (1.5 x 96 CPUs here) stalls on shared serverless
+    hosts — measured 8-18 fps at veryfast; SLICE threading / a thread cap / a lighter preset do not.
+    HDR (color_space set) keeps the upstream path untouched.
+    """
+    from pathlib import Path as _P  # noqa: PLC0415
+
+    import av  # noqa: PLC0415
+    from ltx_core.color.audio_mux import prepare_audio_stream, validate_audio_waveform, write_audio  # noqa: PLC0415
+    from ltx_core.color.yuv import PixelFormat, yuv420p_bt709_converter_  # noqa: PLC0415
+    from ltx_pipelines.utils.media_io import encode as UE  # noqa: PLC0415
+
+    preset = preset or X264_PRESET
+    thread_count = X264_THREADS if thread_count is None else thread_count
+    thread_type = (thread_type or X264_THREAD_TYPE).upper()
+    if color_space is not None:
+        return UE.encode_video(video=video, fps=fps, audio=audio, output_path=output_path,
+                               video_chunks_number=video_chunks_number, color_space=color_space)
+    if audio is not None:
+        validate_audio_waveform(audio)
+    if isinstance(video, _TORCH.Tensor):
+        video = iter([video])
+    frame_converter = yuv420p_bt709_converter_
+
+    def convert(chunk):
+        return frame_converter(chunk.movedim(-1, -3))
+
+    first_raw = next(video, None)
+    if first_raw is None:
+        raise ValueError("video is empty; expected at least one frame chunk.")
+    first = convert(first_raw)
+    if frame_converter.pixel_format == PixelFormat.RGB24:
+        height, width = first.shape[-3], first.shape[-2]
+    else:
+        height, width = first.shape[-2] * 2 // 3, first.shape[-1]
+    _P(output_path).parent.mkdir(parents=True, exist_ok=True)
+    container = av.open(str(output_path), mode="w")
+    ok = False
+    try:
+        stream = container.add_stream("libx264", rate=int(fps), options={"crf": str(crf), "preset": preset})
+        stream.width, stream.height = width, height
+        stream.pix_fmt = "yuv420p"
+        stream.codec_context.thread_count = thread_count
+        stream.codec_context.thread_type = thread_type
+        if frame_converter.color_space is not None:
+            stream.codec_context.colorspace = frame_converter.color_space.av_colorspace
+        if frame_converter.color_range is not None:
+            stream.codec_context.color_range = frame_converter.color_range.av_color_range
+        audio_stream = prepare_audio_stream(container, audio.sampling_rate) if audio is not None else None
+
+        def cpu_chunks():
+            yield first.to("cpu").numpy()
+            for chunk in video:
+                yield convert(chunk).to("cpu").numpy()
+
+        UE._encode_chunks_threaded(container=container, stream=stream, av_format=frame_converter.pixel_format.av_format,
+                                   chunks=cpu_chunks(), progress_total=video_chunks_number)
+        if audio is not None:
+            write_audio(container, audio_stream, audio)
+        ok = True
+    finally:
+        container.close()
+        if not ok:
+            _P(output_path).unlink(missing_ok=True)
+    return None
 
 
 def do_gen(inp, out_path):
@@ -466,9 +543,9 @@ def do_gen(inp, out_path):
             tiling_config=D.AUTO_TILING, generated_keyframes=args.num_generated_keyframes,
         )
         te = time.time()
-        D.encode_video(video=video, fps=args.frame_rate, audio=audio, output_path=out,
-                       video_chunks_number=D.get_video_chunks_number(num_frames, tiling_config),
-                       color_space=hdr, preset=X264_PRESET, thread_count=X264_THREADS)
+        encode_video_fast(video=video, fps=args.frame_rate, audio=audio, output_path=out,
+                          video_chunks_number=D.get_video_chunks_number(num_frames, tiling_config),
+                          color_space=hdr)
         _TIMINGS["mp4_s"] = round(time.time() - te, 2)  # includes the decode chunks it pulls through
     return {"gen_s": round(time.time() - t0, 1), "timings": _take_timings()}
 
@@ -551,9 +628,9 @@ def do_retake(inp, src_path, out_path):
             tiling_config=AUTO_TILING,
             max_batch_size=args.max_batch_size,
         )
-        encode_video(video=video_iter, fps=int(src.fps), audio=audio, output_path=out,
-                     video_chunks_number=get_video_chunks_number(src.frames, tiling_config),
-                     color_space=hdr)
+        encode_video_fast(video=video_iter, fps=int(src.fps), audio=audio, output_path=out,
+                          video_chunks_number=get_video_chunks_number(src.frames, tiling_config),
+                          color_space=hdr)
     return {"gen_s": round(time.time() - t0, 1), "timings": _take_timings()}
 
 
