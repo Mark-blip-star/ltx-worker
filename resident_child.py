@@ -47,15 +47,19 @@ if DIFFVAE_MODE == "default":
     DIFFVAE_MODE = ""
 COMPILE = os.environ.get("LTX25_COMPILE", "").strip()  # "", "1" (defaults) or "k=v k=v" CompilationConfig overrides
 # v9.13: mp4 stage. H100/H200 have no NVENC, so the lever is libx264 settings + knowing the CPU budget.
-X264_PRESET = os.environ.get("LTX25_X264_PRESET", "veryfast").strip()
-X264_THREADS = int(os.environ.get("LTX25_X264_THREADS", "0") or 0)  # 0 = ffmpeg auto
+# "auto" = bench veryfast/superfast/ultrafast at init and keep the first that does >= X264_MIN_FPS on
+# THIS host (serverless CPUs are shared: veryfast measured 8-151 fps across hosts, ultrafast 270-430).
+X264_PRESET = os.environ.get("LTX25_X264_PRESET", "auto").strip()
+X264_THREADS = int(os.environ.get("LTX25_X264_THREADS", "16") or 0)  # ffmpeg auto = 1.5 x 96 CPUs here, which stalls
 X264_THREAD_TYPE = os.environ.get("LTX25_X264_THREAD_TYPE", "FRAME").strip().upper()  # FRAME (upstream) | SLICE | AUTO
-WARMUP_SHAPES = [s for s in os.environ.get("LTX25_WARMUP_SHAPES", "1280x704").split(",") if s.strip()]
+X264_MIN_FPS = float(os.environ.get("LTX25_X264_MIN_FPS", "120"))  # 121 frames in <= 1 s
+WARMUP_SHAPES = [s for s in os.environ.get("LTX25_WARMUP_SHAPES", "1280x704,704x1280,1920x1088").split(",") if s.strip()]
 ENCODE_BENCH = _flag("LTX25_ENCODE_BENCH")  # synthetic libx264 bench at init → init.encode_bench
-# preset:threads:thread_type combos; serverless hosts share CPUs, so the bench shows what THIS host gives
 ENCODE_BENCH_COMBOS = os.environ.get(
     "LTX25_ENCODE_BENCH_COMBOS",
-    "veryfast:0:FRAME,veryfast:16:FRAME,veryfast:16:SLICE,superfast:16:SLICE,ultrafast:16:SLICE,ultrafast:0:FRAME").split(",")
+    f"veryfast:{X264_THREADS}:{X264_THREAD_TYPE},superfast:{X264_THREADS}:{X264_THREAD_TYPE},"
+    f"ultrafast:{X264_THREADS}:{X264_THREAD_TYPE}").split(",")
+_X264 = {"preset": X264_PRESET if X264_PRESET != "auto" else "veryfast"}
 COMPONENTS = {
     "transformer-path": os.environ.get(
         "LTX25_TRANSFORMER_FILE",
@@ -383,12 +387,16 @@ def do_init():
             "knobs": {"enhancer": ENHANCER, "static_cache": ENHANCE_STATIC_CACHE, "resident_decoders": RESIDENT_DECODERS,
                       "warmup": WARMUP, "diffvae_mode": DIFFVAE_MODE or "default", "compile": COMPILE or "off"}}
     info["cpu"] = _cpu_budget()
-    if ENCODE_BENCH:
+    if ENCODE_BENCH or X264_PRESET == "auto":
         try:
             info["encode_bench"] = _encode_bench()
         except Exception as be:  # noqa: BLE001
             info["encode_bench"] = {"error": str(be)[:200]}
         log(f"encode bench: {info['encode_bench']}")
+        if X264_PRESET == "auto":
+            _X264["preset"] = _pick_preset(info["encode_bench"])
+    info["x264"] = {"preset": _X264["preset"], "threads": X264_THREADS, "thread_type": X264_THREAD_TYPE}
+    log(f"x264: {info['x264']}")
     if WARMUP:
         # Prod shapes (121f) — pays the per-shape warm-up and any chunked_compile/--compile builds
         # once per worker, not on the first user job (measured +6s on prod 22.08 after 17f-only
@@ -412,6 +420,17 @@ def do_init():
             log(f"warmup {shape}: {info['warmup'][-1]}")
             Path("/tmp/warm.mp4").unlink(missing_ok=True)
     return info
+
+
+def _pick_preset(bench):
+    """First preset in bench order that clears X264_MIN_FPS; the lightest one if none does."""
+    last = "ultrafast"
+    for combo, r in bench.items():
+        preset = combo.split(":")[0]
+        last = preset
+        if isinstance(r, dict) and r.get("fps", 0) >= X264_MIN_FPS:
+            return preset
+    return last
 
 
 def _cpu_budget():
@@ -467,7 +486,7 @@ def encode_video_fast(video, fps, audio, output_path, video_chunks_number, color
     from ltx_core.color.yuv import PixelFormat, yuv420p_bt709_converter_  # noqa: PLC0415
     from ltx_pipelines.utils.media_io import encode as UE  # noqa: PLC0415
 
-    preset = preset or X264_PRESET
+    preset = preset or _X264["preset"]
     thread_count = X264_THREADS if thread_count is None else thread_count
     thread_type = (thread_type or X264_THREAD_TYPE).upper()
     if color_space is not None:
