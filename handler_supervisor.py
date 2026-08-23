@@ -43,6 +43,31 @@ def _s3():
     return _S3["client"]
 
 
+MAX_SOURCE_BYTES = 64 * 1024 * 1024
+
+
+def _fetch_source(url, dest):
+    """Download a retake source (http/https only, capped) straight into the container."""
+    import urllib.request  # noqa: PLC0415
+
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("video_url must be http(s)")
+    req = urllib.request.Request(url, headers={"User-Agent": "YEngineWorker/1.0"})
+    with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as out:
+        total = 0
+        while True:
+            chunk = resp.read(1 << 20)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_SOURCE_BYTES:
+                raise ValueError(f"source larger than {MAX_SOURCE_BYTES} bytes")
+            out.write(chunk)
+    if total == 0:
+        raise ValueError("empty source")
+    return total
+
+
 def _probe(path):
     """width/height/has_audio the backend would otherwise ffprobe on the droplet."""
     out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,width,height",
@@ -151,12 +176,21 @@ def handler(job):
         out = "/tmp/out.mp4"
         task = str(inp.get("task") or "gen").lower()
         if task == "retake":
-            if not inp.get("video_b64"):
-                return {"error": "retake requires video_b64 (source video)"}
             src = Path("/tmp/retake_src.mp4")
-            src.write_bytes(base64.b64decode(inp["video_b64"]))
+            if inp.get("video_url"):
+                # v9.17: the source comes by URL — base64 in /run hit RunPod's request cap on big
+                # clips (an 18 MB 720p source became 24 MB of JSON → 400/502, 23.08).
+                try:
+                    _fetch_source(str(inp["video_url"]), src)
+                except Exception as fe:  # noqa: BLE001
+                    return {"error": f"retake source fetch failed: {str(fe)[:200]}"}
+            elif inp.get("video_b64"):
+                src.write_bytes(base64.b64decode(inp["video_b64"]))
+            else:
+                return {"error": "retake requires video_url or video_b64 (source video)"}
             r_inp = dict(inp)
             r_inp.pop("video_b64", None)
+            r_inp.pop("video_url", None)
             r_inp.pop("task", None)
             r = _rpc({"cmd": "retake", "input": r_inp, "src": str(src), "out": out}, timeout=1800)
         else:
