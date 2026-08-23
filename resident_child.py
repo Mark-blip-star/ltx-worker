@@ -46,6 +46,11 @@ DIFFVAE_MODE = os.environ.get("LTX25_DIFFVAE_MODE", "chunked_compile").strip()  
 if DIFFVAE_MODE == "default":
     DIFFVAE_MODE = ""
 COMPILE = os.environ.get("LTX25_COMPILE", "").strip()  # "", "1" (defaults) or "k=v k=v" CompilationConfig overrides
+# v9.13: mp4 stage. H100/H200 have no NVENC, so the lever is libx264 settings + knowing the CPU budget.
+X264_PRESET = os.environ.get("LTX25_X264_PRESET", "veryfast").strip()
+X264_THREADS = int(os.environ.get("LTX25_X264_THREADS", "0") or 0)  # 0 = ffmpeg auto
+WARMUP_SHAPES = [s for s in os.environ.get("LTX25_WARMUP_SHAPES", "1280x704").split(",") if s.strip()]
+ENCODE_BENCH = _flag("LTX25_ENCODE_BENCH")  # synthetic libx264 bench at init → init.encode_bench
 COMPONENTS = {
     "transformer-path": os.environ.get(
         "LTX25_TRANSFORMER_FILE",
@@ -372,26 +377,72 @@ def do_init():
             "weights_src": weights_src, "models_dir": str(MODELS),
             "knobs": {"enhancer": ENHANCER, "static_cache": ENHANCE_STATIC_CACHE, "resident_decoders": RESIDENT_DECODERS,
                       "warmup": WARMUP, "diffvae_mode": DIFFVAE_MODE or "default", "compile": COMPILE or "off"}}
-    if WARMUP:
-        # Prod shape (1280x704x121f, enhancer on) — pays the per-shape warm-up, the enhancer's
-        # static-cache compile and any --compile/chunked_compile builds once per worker, not on
-        # the first user job (measured +6s on prod 22.08 after 17f-only keepalives).
-        tw = time.time()
+    info["cpu"] = _cpu_budget()
+    if ENCODE_BENCH:
         try:
-            r = do_gen({"prompt": "A red kite rises over a windy beach at sunset. Audio: wind, gentle waves.",
-                        "seed": 1, "width": 1280, "height": 704, "fps": 24, "frames": 121,
-                        "enhance": ENHANCER}, "/tmp/warm.mp4")
-            info["warmup"] = {"ok": True, "gen_s": r.get("gen_s"), "timings": r.get("timings"),
-                              "total_s": round(time.time() - tw, 1)}
-        except Exception as we:  # noqa: BLE001
-            import traceback
-            info["warmup"] = {"ok": False, "error": str(we)[:200], "trace": traceback.format_exc()[-1200:],
-                              "total_s": round(time.time() - tw, 1)}
-            if _cuda_context_poisoned(we):
-                raise
-        log(f"warmup: {info['warmup']}")
-        Path("/tmp/warm.mp4").unlink(missing_ok=True)
+            info["encode_bench"] = _encode_bench()
+        except Exception as be:  # noqa: BLE001
+            info["encode_bench"] = {"error": str(be)[:200]}
+        log(f"encode bench: {info['encode_bench']}")
+    if WARMUP:
+        # Prod shapes (121f) — pays the per-shape warm-up and any chunked_compile/--compile builds
+        # once per worker, not on the first user job (measured +6s on prod 22.08 after 17f-only
+        # keepalives). LTX25_WARMUP_SHAPES lists WxH; 1920x1088 too when combined_compile is on.
+        info["warmup"] = []
+        for shape in WARMUP_SHAPES:
+            w, h = (int(v) for v in shape.lower().split("x"))
+            tw = time.time()
+            try:
+                r = do_gen({"prompt": "A red kite rises over a windy beach at sunset. Audio: wind, gentle waves.",
+                            "seed": 1, "width": w, "height": h, "fps": 24, "frames": 121,
+                            "enhance": ENHANCER}, "/tmp/warm.mp4")
+                info["warmup"].append({"shape": shape, "ok": True, "gen_s": r.get("gen_s"),
+                                       "timings": r.get("timings"), "total_s": round(time.time() - tw, 1)})
+            except Exception as we:  # noqa: BLE001
+                import traceback
+                info["warmup"].append({"shape": shape, "ok": False, "error": str(we)[:200],
+                                       "trace": traceback.format_exc()[-1200:], "total_s": round(time.time() - tw, 1)})
+                if _cuda_context_poisoned(we):
+                    raise
+            log(f"warmup {shape}: {info['warmup'][-1]}")
+            Path("/tmp/warm.mp4").unlink(missing_ok=True)
     return info
+
+
+def _cpu_budget():
+    """How much CPU libx264 really gets: logical CPUs, the affinity mask and the cgroup quota."""
+    out = {"cpu_count": os.cpu_count()}
+    try:
+        out["affinity"] = len(os.sched_getaffinity(0))
+    except Exception:  # noqa: BLE001
+        pass
+    for path in ("/sys/fs/cgroup/cpu.max", "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"):
+        try:
+            out["cgroup_cpu"] = Path(path).read_text().strip()
+            break
+        except OSError:
+            continue
+    return out
+
+
+def _encode_bench(frames=48, width=1280, height=704):
+    """libx264 alone, no decoder in the loop: fps per preset on this container's CPU budget."""
+    import numpy as np  # noqa: PLC0415
+    from ltx_pipelines.utils.media_io import encode_video  # noqa: PLC0415
+
+    rng = np.random.default_rng(0)
+    base = rng.integers(0, 256, size=(height, width, 3), dtype=np.uint8)
+    frames_np = np.stack([np.roll(base, shift=i * 7, axis=1) for i in range(frames)])
+    video = _TORCH.from_numpy(frames_np).float().div_(255.0).to("cuda")  # [F,H,W,C] in [0,1]
+    res = {}
+    for preset in ("veryfast", "ultrafast"):
+        t0 = time.time()
+        encode_video(video=video, fps=24, audio=None, output_path="/tmp/bench.mp4", video_chunks_number=1,
+                     preset=preset, thread_count=X264_THREADS)
+        dt = time.time() - t0
+        res[preset] = {"fps": round(frames / dt, 1), "kb": Path("/tmp/bench.mp4").stat().st_size // 1024}
+    Path("/tmp/bench.mp4").unlink(missing_ok=True)
+    return res
 
 
 def do_gen(inp, out_path):
@@ -417,7 +468,7 @@ def do_gen(inp, out_path):
         te = time.time()
         D.encode_video(video=video, fps=args.frame_rate, audio=audio, output_path=out,
                        video_chunks_number=D.get_video_chunks_number(num_frames, tiling_config),
-                       color_space=hdr)
+                       color_space=hdr, preset=X264_PRESET, thread_count=X264_THREADS)
         _TIMINGS["mp4_s"] = round(time.time() - te, 2)  # includes the decode chunks it pulls through
     return {"gen_s": round(time.time() - t0, 1), "timings": _take_timings()}
 
