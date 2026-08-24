@@ -92,6 +92,160 @@ def _parse_loras(spec):
 
 LORAS = _parse_loras(os.environ.get("LTX25_LORAS", ""))
 
+# v9.19: portable compile cache. The 130s warm-up is torch.compile of the DiffVAE decoder —
+# identical code on identical H200s in the identical image, recompiled by every worker. A warmed
+# worker saves the torch mega-cache (fx-graph + inductor + triton artifacts) plus the raw
+# TORCHINDUCTOR/TRITON cache dirs as one tar.zst; fresh workers load it before the first compile
+# and the warm-up drops to executing the warm-up clips. Everything is fail-open: any miss or
+# error leaves this worker exactly as fast as v9.18.
+COMPILE_CACHE = _flag("LTX25_COMPILE_CACHE", "0")
+COMPILE_CACHE_SAVE = _flag("LTX25_COMPILE_CACHE_SAVE", "0")
+COMPILE_CACHE_URL = os.environ.get("LTX25_COMPILE_CACHE_URL", "").strip()
+COMPILE_CACHE_KEY = os.environ.get("LTX25_COMPILE_CACHE_KEY", "auto").strip()
+# Deterministic cache dirs (default is per-uid tmp) so save/load tar the same paths everywhere.
+INDUCTOR_DIR = os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/tmp/ind-cache")
+TRITON_DIR = os.environ.setdefault("TRITON_CACHE_DIR", "/tmp/trt-cache")
+# v9.19: warm-up clips do not need prod frame counts — T is marked dynamic like H/W, so a 17f
+# clip compiles the same kernels ~10s/shape cheaper. 121 keeps v9.18 behaviour.
+WARMUP_FRAMES = int(os.environ.get("LTX25_WARMUP_FRAMES", "121") or 121)
+# v9.19 lazy-warm prototype: skip the init warm-up entirely — the first real job of each shape
+# pays its own trace+first-run (cheap once the compile cache is loaded). Measurement knob for
+# the "ready before warm-up" design; not for prod until the lab numbers say so.
+LAZY_WARMUP = _flag("LTX25_LAZY_WARMUP", "0")
+
+_CACHE_STATE = {"src": "off", "key": None, "load_s": None, "note": None}
+
+
+def _cache_key():
+    if COMPILE_CACHE_KEY != "auto":
+        return COMPILE_CACHE_KEY
+    build = "nobuild"
+    try:
+        build = Path("/BUILD_COMMIT").read_text().strip()[:12]
+    except OSError:
+        pass
+    torch_v = arch = "na"
+    try:
+        import torch  # noqa: PLC0415
+
+        torch_v = torch.__version__.split("+")[0]
+        cap = torch.cuda.get_device_capability()
+        arch = f"sm{cap[0]}{cap[1]}"
+    except Exception:  # noqa: BLE001
+        pass
+    return f"{build}-{torch_v}-{arch}"
+
+
+def _cache_tar_candidates(key):
+    """Local paths that may hold the cache tar: the seeded weights repo first, then a
+    local download spot for the Spaces/URL fallback."""
+    return [MODELS / "compile-cache" / f"{key}.tar.zst", Path(f"/tmp/compile-cache-{key}.tar.zst")]
+
+
+def load_compile_cache():
+    """Before the first torch.compile: mega-cache blob if present, else unpack the dirs tar.
+    Returns via _CACHE_STATE; every failure path degrades to plain compilation."""
+    if not COMPILE_CACHE:
+        return
+    t0 = time.time()
+    key = _cache_key()
+    _CACHE_STATE.update(src="miss", key=key)
+    tar = next((c for c in _cache_tar_candidates(key) if c.is_file()), None)
+    if tar is None and (COMPILE_CACHE_URL or _spaces_env_ok()):
+        dest = Path(f"/tmp/compile-cache-{key}.tar.zst")
+        try:
+            if COMPILE_CACHE_URL:
+                subprocess.run(["curl", "-fsSL", "-o", str(dest), COMPILE_CACHE_URL],
+                               check=True, timeout=300)
+            else:
+                _spaces_download(f"compile-cache/{key}.tar.zst", dest)
+            tar = dest if dest.is_file() else None
+        except Exception as e:  # noqa: BLE001
+            _CACHE_STATE["note"] = f"fetch failed: {str(e)[:120]}"
+    if tar is None:
+        log(f"compile-cache: miss for {key}")
+        return
+    try:
+        workdir = Path("/tmp/compile-cache-unpack")
+        subprocess.run(["rm", "-rf", str(workdir)], check=False)
+        workdir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["tar", "--zstd", "-xf", str(tar), "-C", str(workdir)], check=True, timeout=300)
+        blob = workdir / "mega.bin"
+        if blob.is_file():
+            import torch  # noqa: PLC0415
+
+            torch.compiler.load_cache_artifacts(blob.read_bytes())
+            _CACHE_STATE["src"] = "mega+" + ("seeded" if str(tar).startswith(str(MODELS)) else "fetched")
+        for sub, dst in (("inductor", INDUCTOR_DIR), ("triton", TRITON_DIR)):
+            src = workdir / sub
+            if src.is_dir():
+                Path(dst).mkdir(parents=True, exist_ok=True)
+                subprocess.run(["cp", "-a", f"{src}/.", dst], check=True, timeout=120)
+        if _CACHE_STATE["src"] == "miss":
+            _CACHE_STATE["src"] = "dirs+" + ("seeded" if str(tar).startswith(str(MODELS)) else "fetched")
+    except Exception as e:  # noqa: BLE001
+        _CACHE_STATE.update(src="error", note=str(e)[:160])
+        log(f"compile-cache: load failed (fail-open): {e!r}")
+    _CACHE_STATE["load_s"] = round(time.time() - t0, 1)
+    log(f"compile-cache: {_CACHE_STATE}")
+
+
+def save_compile_cache():
+    """After warm-up: mega blob + both cache dirs into one tar.zst, shipped to Spaces."""
+    if not COMPILE_CACHE_SAVE:
+        return None
+    t0 = time.time()
+    key = _cache_key()
+    try:
+        import torch  # noqa: PLC0415
+
+        workdir = Path("/tmp/compile-cache-save")
+        subprocess.run(["rm", "-rf", str(workdir)], check=False)
+        workdir.mkdir(parents=True)
+        try:
+            art = torch.compiler.save_cache_artifacts()
+            if art:
+                (workdir / "mega.bin").write_bytes(art[0] if isinstance(art, tuple) else art)
+        except Exception as e:  # noqa: BLE001
+            log(f"compile-cache: mega save unavailable ({e!r}); shipping dirs only")
+        for sub, src in (("inductor", INDUCTOR_DIR), ("triton", TRITON_DIR)):
+            if Path(src).is_dir():
+                subprocess.run(["cp", "-a", src, str(workdir / sub)], check=True, timeout=120)
+        tar = Path(f"/tmp/compile-cache-{key}.tar.zst")
+        subprocess.run(["tar", "--zstd", "-cf", str(tar), "-C", str(workdir), "."], check=True, timeout=600)
+        size_mb = tar.stat().st_size // (1024 * 1024)
+        _spaces_upload(tar, f"compile-cache/{key}.tar.zst")
+        out = {"key": key, "size_mb": size_mb, "save_s": round(time.time() - t0, 1)}
+        log(f"compile-cache: saved {out}")
+        return out
+    except Exception as e:  # noqa: BLE001
+        log(f"compile-cache: save failed: {e!r}")
+        return {"error": str(e)[:160]}
+
+
+def _spaces_env_ok():
+    return all(os.environ.get(f"SPACES_{k}", "").strip() for k in ("REGION", "BUCKET", "ACCESS_KEY", "SECRET_KEY"))
+
+
+def _spaces_client():
+    import boto3  # noqa: PLC0415
+    from botocore.config import Config  # noqa: PLC0415
+
+    region = os.environ["SPACES_REGION"].strip()
+    return boto3.client("s3", region_name=region, endpoint_url=f"https://{region}.digitaloceanspaces.com",
+                        aws_access_key_id=os.environ["SPACES_ACCESS_KEY"].strip(),
+                        aws_secret_access_key=os.environ["SPACES_SECRET_KEY"].strip(),
+                        config=Config(retries={"max_attempts": 3}, connect_timeout=5, read_timeout=120))
+
+
+def _spaces_download(key, dest):
+    _spaces_client().download_file(os.environ["SPACES_BUCKET"].strip(), key, str(dest))
+
+
+def _spaces_upload(path, key):
+    _spaces_client().upload_file(str(path), os.environ["SPACES_BUCKET"].strip(), key,
+                                 ExtraArgs={"ACL": "private"})
+
 _PIPE = None
 _PARSER = None
 _TORCH = None
@@ -410,6 +564,10 @@ def do_init():
     log("importing torch + ltx stack...")
     import torch  # noqa: PLC0415
     from ltx_pipelines import distilled as D  # noqa: PLC0415
+    try:
+        load_compile_cache()  # before any torch.compile call
+    except Exception as ce:  # noqa: BLE001
+        log(f"compile-cache: unexpected load error (fail-open): {ce!r}")
     _TORCH = torch
     _make_resident()
     try:
@@ -471,7 +629,7 @@ def do_init():
             _X264["preset"] = _pick_preset(info["encode_bench"])
     info["x264"] = {"preset": _X264["preset"], "threads": X264_THREADS, "thread_type": X264_THREAD_TYPE}
     log(f"x264: {info['x264']}")
-    if WARMUP:
+    if WARMUP and not LAZY_WARMUP:
         # Prod shapes (121f) — pays the per-shape warm-up and any chunked_compile/--compile builds
         # once per worker, not on the first user job (measured +6s on prod 22.08 after 17f-only
         # keepalives). LTX25_WARMUP_SHAPES lists WxH; 1920x1088 too when combined_compile is on.
@@ -481,7 +639,7 @@ def do_init():
             tw = time.time()
             try:
                 r = do_gen({"prompt": "A red kite rises over a windy beach at sunset. Audio: wind, gentle waves.",
-                            "seed": 1, "width": w, "height": h, "fps": 24, "frames": 121,
+                            "seed": 1, "width": w, "height": h, "fps": 24, "frames": WARMUP_FRAMES,
                             "enhance": ENHANCER}, "/tmp/warm.mp4")
                 info["warmup"].append({"shape": shape, "ok": True, "gen_s": r.get("gen_s"),
                                        "timings": r.get("timings"), "total_s": round(time.time() - tw, 1)})
@@ -493,6 +651,13 @@ def do_init():
                     raise
             log(f"warmup {shape}: {info['warmup'][-1]}")
             Path("/tmp/warm.mp4").unlink(missing_ok=True)
+    if LAZY_WARMUP:
+        info["warmup"] = "lazy"
+    if COMPILE_CACHE:
+        info["compile_cache"] = dict(_CACHE_STATE)
+    saved = save_compile_cache()
+    if saved:
+        info["compile_cache_saved"] = saved
     return info
 
 
