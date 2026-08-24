@@ -70,6 +70,28 @@ COMPONENTS = {
     "spatial-upsampler-path": "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
 }
 
+# v9.18: optional adapter LoRAs, fused into the resident transformer at init. Env-only, so ONE
+# image serves the plain prod endpoints and a LoRA endpoint. LTX25_LORAS lists files (in
+# LTX25_LORA_REPO) as "name.safetensors:strength", comma-separated; unset => argv unchanged =>
+# bit-exact to v9.17. Fusion is key-driven and silently skips LoRA keys the transformer does not
+# have, so init reports how many modules actually matched (see _lora_report).
+LORA_REPO = os.environ.get("LTX25_LORA_REPO", "").strip()
+LORA_DIR = Path(os.environ.get("LTX25_LORA_DIR", "/models/loras"))
+
+
+def _parse_loras(spec):
+    out = []
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        name, sep, strength = item.rpartition(":")
+        out.append((name, float(strength)) if sep else (item, 1.0))
+    return out
+
+
+LORAS = _parse_loras(os.environ.get("LTX25_LORAS", ""))
+
 _PIPE = None
 _PARSER = None
 _TORCH = None
@@ -141,6 +163,47 @@ def ensure_weights():
     return "downloaded" if missing else "cached"
 
 
+def ensure_loras():
+    """Pull the adapter files from their own (private) repo into LORA_DIR."""
+    if not LORAS:
+        return "none"
+    missing = [f for f, _ in LORAS if not (LORA_DIR / f).exists()]
+    if missing:
+        if not LORA_REPO:
+            raise RuntimeError(f"LTX25_LORAS wants {missing} but LTX25_LORA_REPO is unset")
+        log(f"downloading {len(missing)} LoRA file(s) from {LORA_REPO}...")
+        subprocess.run(["hf", "download", LORA_REPO, *missing, "--local-dir", str(LORA_DIR)],
+                       check=True, timeout=1800)
+        return "downloaded"
+    return "cached"
+
+
+def _lora_report():
+    """How many LoRA modules actually land on transformer weights. apply_loras() looks up
+    "<model key minus .weight>.lora_A/B.weight" and CONTINUES past every miss, so a LoRA for a
+    different architecture fuses nothing and still reports a clean job. Header-only read."""
+    from safetensors import safe_open  # noqa: PLC0415
+
+    with safe_open(str(MODELS / COMPONENTS["transformer-path"]), framework="pt") as f:
+        prefix = "model.diffusion_model."
+        mkeys = {k[len(prefix):] for k in f.keys() if k.startswith(prefix)}
+    rep = []
+    for fname, strength in LORAS:
+        with safe_open(str(LORA_DIR / fname), framework="pt") as f:
+            mods = [k[len("diffusion_model."):-len(".lora_A.weight")] for k in f.keys()
+                    if k.startswith("diffusion_model.") and k.endswith(".lora_A.weight")]
+        matched = sum(1 for m in mods if m + ".weight" in mkeys)
+        rep.append({"file": fname, "strength": strength, "modules": len(mods), "matched": matched})
+        if matched < len(mods):
+            log(f"WARNING: LoRA {fname} matched {matched}/{len(mods)} modules — the rest fuse nothing")
+    return rep
+
+
+def _lora_argv():
+    return [a for fname, strength in LORAS
+            for a in ("--lora", str(LORA_DIR / fname), str(strength))]
+
+
 def job_argv(inp, img_path, out_path):
     argv = []
     for flag, rel in COMPONENTS.items():
@@ -162,6 +225,7 @@ def job_argv(inp, img_path, out_path):
         if ENHANCE_STATIC_CACHE:
             argv += ["--enhance-static-cache"]
     argv += _perf_argv()
+    argv += _lora_argv()
     argv += [str(a) for a in inp.get("extra_args", [])]
     return argv
 
@@ -207,6 +271,7 @@ def retake_argv(inp, src_path, out_path):
         if ENHANCE_STATIC_CACHE:
             argv += ["--enhance-static-cache"]
     argv += _perf_argv()
+    argv += _lora_argv()
     argv += [str(a) for a in inp.get("extra_args", [])]
     return argv
 
@@ -340,6 +405,7 @@ def do_init():
     global _PIPE, _PARSER, _TORCH
     t0 = time.time()
     weights_src = ensure_weights()
+    lora_src = ensure_loras()
     t_dl = time.time()
     log("importing torch + ltx stack...")
     import torch  # noqa: PLC0415
@@ -370,6 +436,12 @@ def do_init():
         D.default_2_stage_distilled_arg_parser(
             params=D.resolve_cli_params(distilled=True), supports_auto_duration=True))
     args = _PARSER.parse_args(job_argv({}, None, "/tmp/warm.mp4"))
+    if LORAS:
+        try:
+            lora_info = _lora_report()
+        except Exception as le:  # noqa: BLE001
+            lora_info = [{"error": str(le)[:200]}]
+        log(f"loras: {lora_info}")
     log("building resident pipeline...")
     _PIPE = D.DistilledPipeline(
         model_paths=args.model_paths,
@@ -383,9 +455,11 @@ def do_init():
     )
     log("resident pipeline READY")
     info = {"download_s": round(t_dl - t0, 1), "build_s": round(time.time() - t_dl, 1),
-            "weights_src": weights_src, "models_dir": str(MODELS),
+            "weights_src": weights_src, "models_dir": str(MODELS), "loras_src": lora_src,
             "knobs": {"enhancer": ENHANCER, "static_cache": ENHANCE_STATIC_CACHE, "resident_decoders": RESIDENT_DECODERS,
                       "warmup": WARMUP, "diffvae_mode": DIFFVAE_MODE or "default", "compile": COMPILE or "off"}}
+    if LORAS:
+        info["loras"] = lora_info
     info["cpu"] = _cpu_budget()
     if ENCODE_BENCH or X264_PRESET == "auto":
         try:
