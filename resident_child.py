@@ -658,7 +658,28 @@ def do_init():
     saved = save_compile_cache()
     if saved:
         info["compile_cache_saved"] = saved
+    fatal = _fatal_init_reason(info)
+    if fatal:
+        info["fatal"] = fatal
+        log(f"init fatal: {fatal}")
     return info
+
+
+def _fatal_init_reason(info):
+    """Marks of a host whose GPU is unusable even though init 'finished' (2026-09-08, driver 12.8
+    against a CUDA 13 image): the cache key lost its SM tag, the encode bench never produced a
+    preset, every warm-up shape died in the tile planner. Any one of them means every job that
+    lands here will fail, so the supervisor exits instead of serving."""
+    key = ((info.get("compile_cache") or {}).get("key") or "")
+    if key.endswith("-na"):
+        return f"compile-cache key has no SM tag ({key}) — CUDA never initialised"
+    bench = info.get("encode_bench")
+    if isinstance(bench, dict) and bench.get("error"):
+        return f"encode bench failed: {str(bench['error'])[:160]}"
+    warm = info.get("warmup")
+    if isinstance(warm, list) and warm and all(not w.get("ok") for w in warm):
+        return f"every warm-up shape failed: {str(warm[0].get('error'))[:160]}"
+    return None
 
 
 def _pick_preset(bench):

@@ -22,6 +22,13 @@ CHILD = Path("/app/resident_child.py")
 ERRLOG = Path("/tmp/child.err")
 _STATE = {"proc": None, "q": None, "init": None}
 
+# v9.20 guard, see cuda_preflight.py: a host whose driver predates the image's CUDA runtime used to
+# announce itself ready and fail every job it took. The probe runs in its own short-lived process
+# so this one keeps its promise of never importing torch.
+PREFLIGHT = Path("/app/cuda_preflight.py")
+PREFLIGHT_ENABLED = os.environ.get("LTX25_PREFLIGHT", "1").strip().lower() in ("1", "true", "on")
+PREFLIGHT_TIMEOUT_S = int(os.environ.get("LTX25_PREFLIGHT_TIMEOUT_S", "300") or 300)
+
 # v9.13: the finished clip goes straight to Spaces from here (4-9 MB of base64 through RunPod's
 # status API and a second upload from the droplet were ~1.5-2 s of every clip). Output carries
 # the object keys + probe metadata; anything missing or failing falls back to video_b64.
@@ -161,6 +168,28 @@ def _rpc(msg, timeout):
     return {"ok": False, "error": f"child rpc timeout {timeout}s", "stderr_tail": _stderr_tail()}
 
 
+def _preflight_or_die():
+    """Fail closed: anything short of a working GPU exits before the SDK accepts a single job."""
+    if not PREFLIGHT_ENABLED:
+        print("[preflight] disabled by LTX25_PREFLIGHT", flush=True)
+        return
+    t0 = time.time()
+    try:
+        r = subprocess.run([sys.executable, str(PREFLIGHT)], capture_output=True, text=True,
+                           timeout=PREFLIGHT_TIMEOUT_S, cwd="/app/LTX-2")
+        ok = r.returncode == 0
+        report = (r.stdout or "").strip().splitlines()[-1] if (r.stdout or "").strip() else (r.stderr or "")[-300:]
+    except subprocess.TimeoutExpired:
+        ok, report = False, f"probe timed out after {PREFLIGHT_TIMEOUT_S}s"
+    except Exception as exc:  # noqa: BLE001
+        ok, report = False, f"probe could not run: {exc!r}"[:300]
+    print(f"[preflight] {'ok' if ok else 'FAILED'} in {time.time() - t0:.1f}s: {report}", flush=True)
+    if not ok:
+        print("[preflight] exiting non-zero so the platform replaces this worker", flush=True)
+        sys.stdout.flush()
+        sys.exit(1)
+
+
 def handler(job):
     inp = job.get("input") or {}
     try:
@@ -171,7 +200,15 @@ def handler(job):
             if not r.get("ok"):
                 return {"error": "init failed", **{k: r[k] for k in ("error", "trace") if r.get(k)},
                         "stderr_tail": r.get("stderr_tail") or _stderr_tail(1500)}
-            _STATE["init"] = r.get("init")
+            init = r.get("init") or {}
+            if init.get("fatal"):
+                # Second line of defence behind the preflight: init itself proved the GPU is
+                # unusable. Die without answering — RunPod requeues the job onto another worker,
+                # which beats burning it here and keeping the bad host in the pool.
+                print(f"[preflight] init reported fatal: {init['fatal']} — exiting", flush=True)
+                sys.stdout.flush()
+                os._exit(1)
+            _STATE["init"] = init
 
         out = "/tmp/out.mp4"
         task = str(inp.get("task") or "gen").lower()
@@ -225,4 +262,5 @@ def handler(job):
                 "stderr_tail": _stderr_tail()}
 
 
+_preflight_or_die()
 runpod.serverless.start({"handler": handler})

@@ -35,6 +35,7 @@ RUN uv pip install --python "$VENV/bin/python" runpod "huggingface_hub[cli]" bot
 COPY handler_cleanroom.py /app/handler_cleanroom.py
 COPY handler_resident.py /app/handler_resident.py
 COPY resident_child.py /app/resident_child.py
+COPY cuda_preflight.py /app/cuda_preflight.py
 COPY handler_supervisor.py /app/handler_supervisor.py
 WORKDIR /app/LTX-2
 CMD ["python", "/app/handler_supervisor.py"]
