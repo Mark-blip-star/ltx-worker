@@ -29,6 +29,11 @@ PREFLIGHT = Path("/app/cuda_preflight.py")
 PREFLIGHT_ENABLED = os.environ.get("LTX25_PREFLIGHT", "1").strip().lower() in ("1", "true", "on")
 PREFLIGHT_TIMEOUT_S = int(os.environ.get("LTX25_PREFLIGHT_TIMEOUT_S", "300") or 300)
 
+# v9.22: init before the SDK is ready instead of inside the first job. RunPod bills `running`, not
+# `initializing`, and a lazy init put the whole cold start on the clock: measured 2026-09-09,
+# 596 s of executionTime for a 15 s clip ($0.98 against $0.025 warm). Same work, other phase.
+EAGER_INIT = os.environ.get("LTX25_EAGER_INIT", "0").strip().lower() in ("1", "true", "on")
+
 # v9.13: the finished clip goes straight to Spaces from here (4-9 MB of base64 through RunPod's
 # status API and a second upload from the droplet were ~1.5-2 s of every clip). Output carries
 # the object keys + probe metadata; anything missing or failing falls back to video_b64.
@@ -190,6 +195,33 @@ def _preflight_or_die():
         sys.exit(1)
 
 
+def _eager_init_or_die():
+    """Download, build and warm up while the worker is still `initializing`, so the first customer
+    job pays only for its own frames. A failure here is the same signal the guard looks for: this
+    host cannot serve, so exit and let the platform put a different one in its place."""
+    if not EAGER_INIT:
+        return
+    t0 = time.time()
+    try:
+        _start_child()
+        r = _rpc({"cmd": "init"}, timeout=3600)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[eager-init] could not run: {exc!r}", flush=True)
+        sys.stdout.flush()
+        sys.exit(1)
+    if not r.get("ok"):
+        print(f"[eager-init] FAILED in {time.time() - t0:.1f}s: {str(r.get('error'))[:300]}", flush=True)
+        sys.stdout.flush()
+        sys.exit(1)
+    init = r.get("init") or {}
+    if init.get("fatal"):
+        print(f"[eager-init] fatal: {init['fatal']}", flush=True)
+        sys.stdout.flush()
+        sys.exit(1)
+    _STATE["init"] = init
+    print(f"[eager-init] ready in {time.time() - t0:.1f}s", flush=True)
+
+
 def handler(job):
     inp = job.get("input") or {}
     try:
@@ -263,4 +295,5 @@ def handler(job):
 
 
 _preflight_or_die()
+_eager_init_or_die()
 runpod.serverless.start({"handler": handler})
