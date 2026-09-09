@@ -24,13 +24,34 @@ ARG LTX2_COMMIT=fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca
 RUN mkdir -p /app/LTX-2 && cd /app/LTX-2 && git init -q && \
     git remote add origin https://github.com/Lightricks/LTX-2 && \
     git fetch -q --depth 1 origin ${LTX2_COMMIT} && git checkout -q FETCH_HEAD && \
-    git rev-parse HEAD | tee /BUILD_COMMIT && \
-    uv python install 3.12 && uv sync --python 3.12 && uv cache clean
+    git rev-parse HEAD | tee /BUILD_COMMIT
+
+# v9.21: upstream pins torch 2.13.0 and natten to cu132, and a cu132 runtime needs a driver newer
+# than a large share of the H200 hosts RunPod actually hands out. 2026-09-08: hosts with driver
+# 12.8 could not initialise CUDA at all, so the compile-cache key degraded to `-na`, the x264 bench
+# errored and the DiffVAE tile planner saw usable_bytes=0 — every job on such a host died with
+# "Cannot fit a DiffVAE decode tile" while the endpoint reported itself healthy. natten publishes
+# the same 0.21.7 built against the same torch 2.13.0 for cu126, so this swaps the CUDA channel
+# only: same model code, same decoder, and a runtime that any driver from 12.6 up will run.
+ARG TORCH_CUDA=cu126
+RUN cd /app/LTX-2 && \
+    sed -i "s|whl/test/cu132|whl/test/${TORCH_CUDA}|g; s|whl/cu132|whl/${TORCH_CUDA}|g; \
+            s|torch2130cu132|torch2130${TORCH_CUDA}|g" packages/ltx-core/pyproject.toml && \
+    sed -i "/override-dependencies = \[\"nvidia-cudnn-cu13/d" pyproject.toml && \
+    grep -nE "cu1[0-9]{2}" packages/ltx-core/pyproject.toml
+
+RUN cd /app/LTX-2 && uv python install 3.12 && uv sync --python 3.12 && uv cache clean && \
+    /app/LTX-2/.venv/bin/python -c "import torch; print('BUILD torch', torch.__version__, 'cuda', torch.version.cuda)" && \
+    uv pip list --python /app/LTX-2/.venv/bin/python | grep -iE "^(torch|torchaudio|natten|nvidia-cudnn)"
 ENV VENV=/app/LTX-2/.venv PATH="/app/LTX-2/.venv/bin:${PATH}"
 
+# natten lives in an optional extra upstream, so `uv sync` never installs it and it has to be
+# added here. Pinned to the wheel built for this exact torch and CUDA channel: the old unpinned
+# install took whatever was newest on the flat index, which would quietly drag cu132 back in. No
+# `|| true` either — a missing wheel means a slow fallback decoder in prod, and a build is the
+# right place to find that out.
 RUN uv pip install --python "$VENV/bin/python" runpod "huggingface_hub[cli]" boto3 && \
-    (uv pip install --python "$VENV/bin/python" natten -f https://whl.natten.org || \
-     echo "WARN: no natten wheel matched — DiffVAE stays on fallback")
+    uv pip install --python "$VENV/bin/python" "natten==0.21.7+torch2130${TORCH_CUDA}" -f https://whl.natten.org
 
 COPY handler_cleanroom.py /app/handler_cleanroom.py
 COPY handler_resident.py /app/handler_resident.py
