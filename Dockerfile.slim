@@ -44,7 +44,10 @@ RUN cd /app/LTX-2 && \
     sed -i "/override-dependencies = \[\"nvidia-cudnn-cu13/d" pyproject.toml && \
     grep -rnE "cu1[0-9]{2}" --include=pyproject.toml . | grep -v "\.venv"
 
-RUN cd /app/LTX-2 && uv python install 3.12 && uv sync --python 3.12 && uv cache clean && \
+# --no-dev: the dev group pins cuda-toolkit/nvcc to 13.2 for building ltx-kernels, which torch
+# cu126 (it wants cuda-toolkit 12.6.3) cannot satisfy — and those kernels are excluded from the
+# workspace anyway. Everything else in that group is lint/test tooling with no place in a worker.
+RUN cd /app/LTX-2 && uv python install 3.12 && uv sync --python 3.12 --no-dev && uv cache clean && \
     /app/LTX-2/.venv/bin/python -c "import torch; print('BUILD torch', torch.__version__, 'cuda', torch.version.cuda)" && \
     uv pip list --python /app/LTX-2/.venv/bin/python | grep -iE "^(torch|torchaudio|natten|nvidia-cudnn)"
 ENV VENV=/app/LTX-2/.venv PATH="/app/LTX-2/.venv/bin:${PATH}"
