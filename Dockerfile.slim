@@ -33,12 +33,16 @@ RUN mkdir -p /app/LTX-2 && cd /app/LTX-2 && git init -q && \
 # "Cannot fit a DiffVAE decode tile" while the endpoint reported itself healthy. natten publishes
 # the same 0.21.7 built against the same torch 2.13.0 for cu126, so this swaps the CUDA channel
 # only: same model code, same decoder, and a runtime that any driver from 12.6 up will run.
+# Every workspace member that names the channel has to move together: ltx-pipelines declares its
+# own torch-test index, and uv refuses to resolve when two members point one package at different
+# indexes ("conflicting indexes for package torchaudio").
 ARG TORCH_CUDA=cu126
 RUN cd /app/LTX-2 && \
-    sed -i "s|whl/test/cu132|whl/test/${TORCH_CUDA}|g; s|whl/cu132|whl/${TORCH_CUDA}|g; \
-            s|torch2130cu132|torch2130${TORCH_CUDA}|g" packages/ltx-core/pyproject.toml && \
+    find . -name pyproject.toml -not -path "./.venv/*" -print0 | xargs -0 sed -i \
+        "s|whl/test/cu132|whl/test/${TORCH_CUDA}|g; s|whl/cu132|whl/${TORCH_CUDA}|g; \
+         s|torch2130cu132|torch2130${TORCH_CUDA}|g" && \
     sed -i "/override-dependencies = \[\"nvidia-cudnn-cu13/d" pyproject.toml && \
-    grep -nE "cu1[0-9]{2}" packages/ltx-core/pyproject.toml
+    grep -rnE "cu1[0-9]{2}" --include=pyproject.toml . | grep -v "\.venv"
 
 RUN cd /app/LTX-2 && uv python install 3.12 && uv sync --python 3.12 && uv cache clean && \
     /app/LTX-2/.venv/bin/python -c "import torch; print('BUILD torch', torch.__version__, 'cuda', torch.version.cuda)" && \
