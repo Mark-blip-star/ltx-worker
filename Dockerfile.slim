@@ -47,7 +47,14 @@ RUN cd /app/LTX-2 && \
     # torch ABI, which makes `torchvision::nms` missing and transformers fail to import
     # PreTrainedModel. It has to ride the same index as torch.
     sed -i 's|^torchcodec = { index = "torch" }|torchcodec = { index = "torch" }\ntorchvision = { index = "torch" }|' packages/ltx-trainer/pyproject.toml && \
-    grep -rnE "cu1[0-9]{2}|cuda-toolkit|torchvision" --include=pyproject.toml . | grep -v "\.venv"
+    grep -rnE "cu1[0-9]{2}|cuda-toolkit|torchvision" --include=pyproject.toml . | grep -v "\.venv" ; \
+    # A sed that matches nothing exits 0, so an upstream rename would silently ship a cu132 image
+    # again. These two checks turn that into a failed build: no live cu132 reference may survive,
+    # and torchvision must have gained its source entry.
+    if grep -rqE "whl/cu132|whl/test/cu132|torch2130cu132" --include=pyproject.toml . ; then \
+        echo "CHANNEL PATCH FAILED: a live cu132 reference survived the sed" >&2; exit 1; fi && \
+    grep -q 'torchvision = { index = "torch" }' packages/ltx-trainer/pyproject.toml || \
+        { echo "CHANNEL PATCH FAILED: torchvision has no torch-index source entry" >&2; exit 1; }
 
 RUN cd /app/LTX-2 && uv python install 3.12 && uv sync --python 3.12 && uv cache clean && \
     /app/LTX-2/.venv/bin/python -c "import torch; print('BUILD torch', torch.__version__, 'cuda', torch.version.cuda)" && \
